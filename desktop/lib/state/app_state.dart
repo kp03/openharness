@@ -1,6 +1,7 @@
 import '../core/permission_modes.dart';
 
 import 'dart:async';
+import 'dart:convert' show base64Encode;
 import 'dart:io' show Directory, Platform, exit, pid;
 import 'dart:math' show Random;
 
@@ -574,6 +575,9 @@ class _AgentStop {
 /// automatic: a tab another Mac opened arriving over the desk, a reconnect, a
 /// machine answering its agent list, a push, the dial turning, a handoff.
 enum AttachIntent { person, automatic }
+
+/// What the owner installs on a device from the app.
+enum DeviceAsset { sound, character }
 
 class AppNotifier extends ChangeNotifier {
   final AuthSession session;
@@ -1609,6 +1613,126 @@ class AppNotifier extends ChangeNotifier {
     }
   }
 
+  /// Returns null only after the device verifies and reports the installed sound.
+  Future<String?> setHostDeviceSound(
+    String machineId,
+    String id,
+    String name,
+    Uint8List? encoded,
+  ) => setHostDeviceAsset(DeviceAsset.sound, machineId, id, name, encoded);
+
+  /// Returns null only after the device verifies and reports the installed character.
+  Future<String?> setHostDeviceCharacter(
+    String machineId,
+    String id,
+    String name,
+    Uint8List? encoded,
+  ) => setHostDeviceAsset(DeviceAsset.character, machineId, id, name, encoded);
+
+  /// Whether [machineId]'s device [id] is attached, idle and reports [kind]. This computer's own
+  /// cable is read from `dial_status`, which Settings shows without the Devices tab; another host
+  /// is read from its device listing, which exists only with that tab on.
+  bool _canReachDeviceAsset(DeviceAsset kind, String machineId, String id) {
+    final machine = machineStates[machineId];
+    if (machine == null ||
+        machine.machine.isShared ||
+        machine.isOffline ||
+        machine.needsLink ||
+        (_pool == null && connectionForTest == null)) {
+      return false;
+    }
+    final local = machineId == localMachineState?.machine.machineId
+        ? dial.devices.where((d) => d.id == id).firstOrNull
+        : null;
+    final host = deviceHosts.host(machineId);
+    final DialStatus? target;
+    if (local != null) {
+      target = local;
+    } else if (devicesEnabled &&
+        host?.online == true &&
+        host?.available == true) {
+      target = host?.devices.where((d) => d.id == id).firstOrNull;
+    } else {
+      target = null;
+    }
+    final reported = kind == DeviceAsset.sound
+        ? target?.settings?.soundName
+        : target?.settings?.characterName;
+    return target?.attached == true &&
+        target?.updating == null &&
+        reported != null;
+  }
+
+  /// Install `encoded` as the device's sound or character on the host it is plugged into, or restore
+  /// the default with null. Null back means the device verified and now reports it.
+  Future<String?> setHostDeviceAsset(
+    DeviceAsset kind,
+    String machineId,
+    String id,
+    String name,
+    Uint8List? encoded,
+  ) async {
+    if (!_canReachDeviceAsset(kind, machineId, id)) {
+      return 'Connect a device with current firmware to install a ${kind.name}.';
+    }
+    try {
+      final reply = await _conn(machineId).request(
+        'harness_device_${kind.name}',
+        payload: {
+          'id': id,
+          'name': name,
+          'data': encoded == null ? null : base64Encode(encoded),
+        },
+        // The daemon's own limit (LONG_ANSWERS) plus the trip there and back.
+        timeout: Duration(seconds: kind == DeviceAsset.sound ? 80 : 140),
+      );
+      if (reply['status'] case final Map<String, dynamic> status) {
+        deviceHosts.receive(
+          machineId,
+          DialStatus.fromJson(status),
+          revision: reply['revision'] is int ? reply['revision'] as int : null,
+        );
+      }
+      return reply['ok'] == true
+          ? null
+          : reply['error'] is String
+          ? reply['error'] as String
+          : 'The device did not install the ${kind.name}.';
+    } catch (_) {
+      return 'The ${kind.name} transfer failed. Check the connection and try again.';
+    }
+  }
+
+  /// The test button: the device plays its notification sound, or shows its character's animations,
+  /// as it holds them now. Null back means it did; otherwise one line saying why not.
+  Future<String?> testHostDeviceAsset(
+    DeviceAsset kind,
+    String machineId,
+    String id,
+  ) async {
+    if (!_canReachDeviceAsset(kind, machineId, id)) {
+      return 'Connect a device with current firmware to test its ${kind.name}.';
+    }
+    try {
+      final reply = await _conn(machineId).request(
+        'harness_device_test',
+        payload: {'id': id, 'kind': kind.name},
+        timeout: const Duration(seconds: 8),
+      );
+      return reply['ok'] == true
+          ? null
+          : reply['message'] is String
+          ? reply['message'] as String
+          : 'The device could not test its ${kind.name}.';
+    } on WsRequestFailure catch (failure) {
+      return failure.code == 'UNSUPPORTED'
+          ? 'Update Harness on that computer to test its device.'
+          : 'The device could not test its ${kind.name}.';
+    } catch (_) {
+      return 'The device did not answer. Check the connection and try again.';
+    }
+  }
+
   /// One utility tab for physical devices. The experiment must be explicitly
   /// acknowledged before any entry point, including restored history, opens it.
   void openDevices() {
@@ -2579,7 +2703,9 @@ class AppNotifier extends ChangeNotifier {
       return;
     }
     pane.claimOnFirstAttach = true;
-    if (panes.contains(pane) && _paneNeedsAttach(pane) && _canAttachPane(pane)) {
+    if (panes.contains(pane) &&
+        _paneNeedsAttach(pane) &&
+        _canAttachPane(pane)) {
       pane.claimOnFirstAttach = false;
       await _reattachPane(pane, intent: AttachIntent.person);
     }
@@ -4428,7 +4554,10 @@ class AppNotifier extends ChangeNotifier {
     // Which sign-in this app is under is the device log's to know before anything below can read it
     // (a restored pane, the dial, the pool, a connection's push): synchronous, ahead of the first await.
     // A sign-in by hand just now is `fresh`; a stored session (the app opening) is not.
-    if (signedIn) _deviceLog?.beginSignIn(fresh: viewer?.auth.consumeFreshSignIn() ?? false);
+    if (signedIn)
+      _deviceLog?.beginSignIn(
+        fresh: viewer?.auth.consumeFreshSignIn() ?? false,
+      );
     // Stays on the pre-navigation `bootstrapping` screen (main.dart) until the daemon is
     // confirmed reachable — flipping to `authenticated` any earlier is what let the home UI
     // race `harness start`'s own backend handshake and surface a bogus 30s "Could not load
@@ -6831,7 +6960,8 @@ class AppNotifier extends ChangeNotifier {
   /// Whether [departed] was removed by a key that is itself new and unlooked-at (or one that left that
   /// way): someone who just got in clearing up after themselves. A key's own sign-out is never red.
   bool departedIsRed(DeviceLogDeparted departed) {
-    if (departed.selfRemoved || departed.removedBy == departed.pub) return false;
+    if (departed.selfRemoved || departed.removedBy == departed.pub)
+      return false;
     return newDevices.any((d) => d.pub == departed.removedBy) ||
         departedDevices.any((d) => d.pub == departed.removedBy);
   }
@@ -7019,7 +7149,10 @@ class AppNotifier extends ChangeNotifier {
         frozen = listing.frozen != null;
         pending = listing.pending;
         departed = listing.departed;
-        known = [for (final r in listing.members) NewDeviceNotice.fromMember(r.member, suspended: r.suspended)];
+        known = [
+          for (final r in listing.members)
+            NewDeviceNotice.fromMember(r.member, suspended: r.suspended),
+        ];
       } else {
         final raw = await api.daemonDevices();
         if (raw == null) return;
@@ -7047,7 +7180,10 @@ class AppNotifier extends ChangeNotifier {
       // before it would drop the listing for good. A sign-out bumps the generation instead
       // ([_clearDeviceNoticeState]), and a daemon's listing is the daemon's current account.
       // Nor after a sign-out: a read already in flight must not put the old account's banner back.
-      if (_disposed || generation != _pendingSyncGeneration || status == AppStatus.unauthenticated) return;
+      if (_disposed ||
+          generation != _pendingSyncGeneration ||
+          status == AppStatus.unauthenticated)
+        return;
       _pendingBootReadDone = true;
       if (legacyDaemon) return;
       var changed = frozen != _deviceListFrozen;
@@ -7075,7 +7211,9 @@ class AppNotifier extends ChangeNotifier {
         changed = true;
       }
       if (conflict == null) _dismissedConflict = null;
-      if (daemon && deviceConflict?.pub != (conflict?.pub == _dismissedConflict ? null : conflict?.pub)) {
+      if (daemon &&
+          deviceConflict?.pub !=
+              (conflict?.pub == _dismissedConflict ? null : conflict?.pub)) {
         deviceConflict = conflict?.pub == _dismissedConflict ? null : conflict;
         changed = true;
       }
@@ -7092,10 +7230,14 @@ class AppNotifier extends ChangeNotifier {
   /// changes and the daemon's frames say when to read, so a recovery tick every few seconds does not.
   bool _pendingBootReadDone = false;
 
-  static bool _sameDeparted(List<DeviceLogDeparted> a, List<DeviceLogDeparted> b) {
+  static bool _sameDeparted(
+    List<DeviceLogDeparted> a,
+    List<DeviceLogDeparted> b,
+  ) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      if (a[i].pub != b[i].pub || a[i].removedAt != b[i].removedAt) return false;
+      if (a[i].pub != b[i].pub || a[i].removedAt != b[i].removedAt)
+        return false;
     }
     return true;
   }
@@ -7103,7 +7245,8 @@ class AppNotifier extends ChangeNotifier {
   static bool _samePubs(List<NewDeviceNotice> a, List<NewDeviceNotice> b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      if (a[i].pub != b[i].pub || a[i].suspended != b[i].suspended) return false;
+      if (a[i].pub != b[i].pub || a[i].suspended != b[i].suspended)
+        return false;
     }
     return true;
   }
@@ -7111,11 +7254,17 @@ class AppNotifier extends ChangeNotifier {
   /// Persists "seen" for [pub] (one), every device (neither) or the baseline panel, in whichever copy
   /// of the log this end keeps. Only when that cannot be — a daemon that predates it — does it stay
   /// in memory ([_dismissedDevices]).
-  Future<void> _persistSeen({String? pub, List<String>? pubs, bool baseline = false}) async {
+  Future<void> _persistSeen({
+    String? pub,
+    List<String>? pubs,
+    bool baseline = false,
+  }) async {
     // Which dismissals this write settles; the baseline panel's "Got it" settles none of them.
     void settled() {
       if (baseline) return;
-      _dismissedDevices.removeWhere((p) => pub != null ? p == pub : (pubs?.contains(p) ?? true));
+      _dismissedDevices.removeWhere(
+        (p) => pub != null ? p == pub : (pubs?.contains(p) ?? true),
+      );
     }
 
     try {
@@ -7128,7 +7277,11 @@ class AppNotifier extends ChangeNotifier {
         settled();
         return;
       }
-      if (await api.daemonDismissDevices(pub: pub, pubs: pubs, baseline: baseline)) {
+      if (await api.daemonDismissDevices(
+        pub: pub,
+        pubs: pubs,
+        baseline: baseline,
+      )) {
         settled();
       }
     } catch (_) {}
@@ -7190,7 +7343,9 @@ class AppNotifier extends ChangeNotifier {
     _dismissedDevices.add(pub);
     _pendingSyncGeneration++;
     notifyListeners();
-    unawaited(liftSuspension ? _persistSeen(pub: pub) : _persistSeen(pubs: [pub]));
+    unawaited(
+      liftSuspension ? _persistSeen(pub: pub) : _persistSeen(pubs: [pub]),
+    );
   }
 
   /// "Got it" on a key that joined and left before anyone looked: the one way its flag goes away (the
@@ -7233,7 +7388,8 @@ class AppNotifier extends ChangeNotifier {
   void _announceRemoval(DeviceRemovalNotice notice) {
     // A red notice (a new device nobody looked at removed it) is never softened by a later one for the
     // same key — only the person's own dismissal takes it down.
-    if (!notice.red && deviceRemovals.any((n) => n.pub == notice.pub && n.red)) return;
+    if (!notice.red && deviceRemovals.any((n) => n.pub == notice.pub && n.red))
+      return;
     deviceRemovals.removeWhere((n) => n.pub == notice.pub);
     deviceRemovals.add(notice);
     devicesRevision++;
@@ -7272,7 +7428,9 @@ class AppNotifier extends ChangeNotifier {
   ///
   /// [onListed] hears the banner's devices the moment the listing is read — before the last-seen
   /// request, which the backend can delay — so the list marks as seen only what was shown with it.
-  Future<AccountDevices?> loadDevices({void Function(List<String> banner)? onListed}) async {
+  Future<AccountDevices?> loadDevices({
+    void Function(List<String> banner)? onListed,
+  }) async {
     if (_deviceLog case final log?) {
       final listing = AccountDevices.fromListing(await log.list());
       onListed?.call([for (final d in newDevices) d.pub]);
@@ -7300,15 +7458,24 @@ class AppNotifier extends ChangeNotifier {
   /// A confirm names the [head] the preview showed: if the backend's list is another by now, nothing is
   /// trusted and the answer is [DevicesRebaseline.logChanged]. Another account's list than the one
   /// signed in to is never trusted by a review ([DevicesRebaseline.otherAccount]): signing in again is.
-  Future<DevicesRebaseline?> rebaselineDevices({required bool confirm, DevLogHead? head}) async {
+  Future<DevicesRebaseline?> rebaselineDevices({
+    required bool confirm,
+    DevLogHead? head,
+  }) async {
     final DevicesRebaseline? result;
     if (_deviceLog case final log?) {
-      final r = await log.rebaseline(confirm: confirm, expectedHead: confirm ? head : null);
+      final r = await log.rebaseline(
+        confirm: confirm,
+        expectedHead: confirm ? head : null,
+      );
       // Null is a log that could not be read; a head that moved is a result of its own.
       result = r == null ? null : DevicesRebaseline.fromViewer(r);
     } else {
       result = DevicesRebaseline.fromDaemon(
-        await api.daemonRebaselineDevices(confirm: confirm, head: confirm ? head?.toJson() : null),
+        await api.daemonRebaselineDevices(
+          confirm: confirm,
+          head: confirm ? head?.toJson() : null,
+        ),
       );
     }
     if (confirm && result != null && !result.refused) {
@@ -15708,7 +15875,8 @@ class AppNotifier extends ChangeNotifier {
       case 'device_key_removed':
         // Only this computer's own daemon says this (see [_isOwnDaemonMachine]).
         if (_isOwnDaemonMachine(machineId)) {
-          if (DeviceRemovalNotice.fromJson(payload) case final notice?) _announceRemoval(notice);
+          if (DeviceRemovalNotice.fromJson(payload) case final notice?)
+            _announceRemoval(notice);
         }
         break;
       case 'device_conflict':

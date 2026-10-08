@@ -40,9 +40,14 @@ uint32_t audio_capture_overruns(void);
 // Call once at boot (after the I2C bus is up). Safe no-op if the speaker codec isn't present.
 void audio_notify_init(void);
 
-// Play a short "beep beep" (non-blocking; queues to the beep task). Debounced ~1s.
-// Safe to call from any task (e.g. the commander WS event task on a "done" event).
+// Play the completion cue (non-blocking; queues to the speaker task). Debounced ~1s.
+// Safe to call from any task after a real turn summary arrives.
 void audio_notify_done(void);
+// Short start cue, paired with the active-task animation. Respects device mute
+// and yields immediately to microphone capture, like the completion cue.
+void audio_notify_start(void);
+// The completion cue now, for the app's test button: false when muted or there is no speaker.
+bool audio_notify_test(void);
 
 // Applies immediately, including queued notifications, and persists to NVS.
 bool audio_notify_set_muted(bool muted);

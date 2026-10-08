@@ -21,6 +21,7 @@
 #include "board_pins.h"
 #include "cable_client.h"
 #include "config_store.h"
+#include "custom_character.h"
 #include "fw_update.h"
 #include "last_words.h"
 #include "board/board.h"
@@ -182,6 +183,7 @@ void app_main(void)
     last_words_boot();   // before the first log line, so the previous boot's ring is read, not overwritten
     board_detect();      // which dial this is — the panel's reset pin comes from here, so before display_init
     config_store_init();
+    custom_character_init();   // the installed character, before the first frame draws
 
     if (boot_button_held()) {
         ESP_LOGW(TAG, "BOOT held — factory reset");

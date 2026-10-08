@@ -497,6 +497,7 @@ export const LONG_ANSWERS: Readonly<Record<string, Readonly<Record<string, numbe
     launchTarget: 3 * MINUTE, privateGridName: 2 * MINUTE, lists: 2 * MINUTE,
   },
   store: { dsh_install: 30 * MINUTE, dsh_update: 30 * MINUTE },
+  devices: { harness_device_sound: 75_000, harness_device_character: 135_000 },
 }
 
 /** The orchestrator (services/orchestrator.ts): its projects, for the apps and for the agents it runs. */
@@ -827,7 +828,7 @@ export type VoiceRouteReply = { t: 'taken' } | { t: 'sent'; agentId: string } | 
 
 /** The Devices tab (services/devices.ts): the devices on this computer, and a device's settings. Only
  *  the owner, on this computer or through the owner's own app, may manage them. */
-export const DEVICES_REQUESTS = ['harness_devices_list', 'harness_device_settings'] as const
+export const DEVICES_REQUESTS = ['harness_devices_list', 'harness_device_settings', 'harness_device_sound', 'harness_device_character', 'harness_device_test'] as const
 
 /**
  * The core's calls into the devices: what the windows on this computer said that the dial follows, the

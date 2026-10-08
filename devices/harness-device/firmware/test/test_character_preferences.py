@@ -116,7 +116,7 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='harness-character-pref-') as directory:
     out = Path(directory)
     (out / 'test.c').write_text(code)
-    sources = ['character.c', 'illustrated.c', 'character_motion.c', 'character_layout.c', 'tux.c', 'focus.c', 'lvgl_fonts.c', 'lvgl_icons.c', 'focus_marks.c', 'focus_faces.c', 'pets.c',
+    sources = ['character.c', 'illustrated.c', 'character_motion.c', 'character_layout.c', 'tux.c', 'focus.c', 'lvgl_fonts.c', 'lvgl_icons.c', 'focus_marks.c', 'focus_faces.c', 'pets.c', '../../../test/fakes/custom_character_none.c',
                'octopus.c', 'octopus_font.c', 'ascii_clip.c', 'terminal.c', 'fonts.c']
     for flags in ([], ['-DDEVICE_DEFAULT_CHARACTER_TUX=1']):
         subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g',

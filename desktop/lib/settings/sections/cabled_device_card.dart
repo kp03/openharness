@@ -1,9 +1,17 @@
+import 'dart:async';
+
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../shared/theme/app_theme.dart' as grid;
 import '../../shared/widgets/app_select_field.dart';
 import '../../shared/widgets/setting_row.dart';
 import '../../state/dial_status.dart';
+import '../../devices/character_picker.dart';
+import '../../devices/device_test_button.dart';
+import '../../devices/notification_sound_import.dart';
+import '../../state/app_state.dart' show DeviceAsset;
 
 /// The robot on a cable at this desk, and everything it persists.
 ///
@@ -32,6 +40,9 @@ class CabledDeviceCard extends StatefulWidget {
     super.key,
     required this.devices,
     required this.onChanged,
+    this.onSound,
+    this.onCharacter,
+    this.onTest,
     this.showCompanion = false,
   });
 
@@ -41,6 +52,13 @@ class CabledDeviceCard extends StatefulWidget {
 
   /// Send a patch to one robot. Only the named field travels.
   final void Function(String id, Map<String, Object?> patch) onChanged;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onSound;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onCharacter;
+
+  /// Play the robot's sound, or show its character, as it holds them now. Null back means it did.
+  final Future<String?> Function(String id, DeviceAsset kind)? onTest;
 
   @override
   State<CabledDeviceCard> createState() => _CabledDeviceCardState();
@@ -96,6 +114,9 @@ class _CabledDeviceCardState extends State<CabledDeviceCard> {
         _Rows(
           device: device,
           onChanged: widget.onChanged,
+          onSound: widget.onSound,
+          onCharacter: widget.onCharacter,
+          onTest: widget.onTest,
           showCompanion: widget.showCompanion,
         ),
       ],
@@ -186,12 +207,20 @@ class _Rows extends StatelessWidget {
   const _Rows({
     required this.device,
     required this.onChanged,
+    required this.onSound,
+    required this.onCharacter,
+    required this.onTest,
     required this.showCompanion,
   });
 
   final DialStatus device;
   final bool showCompanion;
   final void Function(String id, Map<String, Object?> patch) onChanged;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onSound;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onCharacter;
+  final Future<String?> Function(String id, DeviceAsset kind)? onTest;
 
   /// The languages the microphone can be transcribed as, each named in itself. The codes are what
   /// the dial sends with every capture and what the backend accepts — VOICE_LANGS in
@@ -336,6 +365,31 @@ class _Rows extends StatelessWidget {
             // a Focus-only firmware ignores the field — a choice here would change nothing.
           ],
         ),
+        // Firmware that cannot hold a character reports no characterName, and gets no group.
+        if (settings.characterName != null && id != null)
+          _Group(
+            title: 'Character',
+            children: [
+              DeviceCharacterPicker(
+                key: ValueKey('character-picker-$id'),
+                name: settings.characterName!,
+                bytes: settings.characterBytes ?? 0,
+                enabled: live,
+                send: onCharacter == null
+                    ? null
+                    : (name, data) => onCharacter!(id, name, data),
+              ),
+              DeviceTestButton(
+                key: ValueKey('character-test-$id'),
+                title: 'Show on the robot',
+                detail: 'Plays each of its animations on the screen for a few seconds.',
+                enabled: live,
+                test: onTest == null
+                    ? null
+                    : () => onTest!(id, DeviceAsset.character),
+              ),
+            ],
+          ),
         _Group(
           title: 'Gestures',
           children: [
@@ -372,6 +426,26 @@ class _Rows extends StatelessWidget {
                 invert: true,
               ),
             ),
+            if (settings.soundName != null && id != null)
+              _CabledSoundPicker(
+                key: ValueKey('sound-picker-$id'),
+                name: settings.soundName!,
+                bytes: settings.soundBytes ?? 0,
+                enabled: live,
+                send: onSound == null
+                    ? null
+                    : (name, data) => onSound!(id, name, data),
+              ),
+            if (settings.soundName != null && id != null)
+              DeviceTestButton(
+                key: ValueKey('sound-test-$id'),
+                title: 'Play on the robot',
+                detail: 'The sound it plays when a turn finishes. Muted robots stay silent.',
+                enabled: live,
+                test: onTest == null
+                    ? null
+                    : () => onTest!(id, DeviceAsset.sound),
+              ),
             SettingRow(
               title: 'Voice language',
               detail:
@@ -390,6 +464,130 @@ class _Rows extends StatelessWidget {
       ],
     );
   }
+}
+
+class _CabledSoundPicker extends StatefulWidget {
+  const _CabledSoundPicker({
+    super.key,
+    required this.name,
+    required this.bytes,
+    required this.enabled,
+    required this.send,
+  });
+  final String name;
+  final int bytes;
+  final bool enabled;
+  final Future<String?> Function(String name, Uint8List? bytes)? send;
+
+  @override
+  State<_CabledSoundPicker> createState() => _CabledSoundPickerState();
+}
+
+class _CabledSoundPickerState extends State<_CabledSoundPicker> {
+  PreparedDeviceSound? chosen;
+  String? error;
+  bool busy = false;
+
+  Future<void> choose() async {
+    try {
+      final file = await openFile();
+      if (file == null) return;
+      setState(() {
+        busy = true;
+        error = null;
+      });
+      final ready = await prepareDeviceSound(file.path);
+      if (mounted) setState(() => chosen = ready);
+    } catch (failure) {
+      if (mounted) {
+        setState(
+          () => error = failure is FormatException
+              ? failure.message
+              : 'Could not prepare this sound.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> send({bool restore = false}) async {
+    final callback = widget.send;
+    if (callback == null || (!restore && chosen == null)) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final result = await callback(
+      restore ? '' : chosen!.name,
+      restore ? null : chosen!.bytes,
+    );
+    if (mounted) {
+      setState(() {
+        busy = false;
+        error = result;
+        if (result == null) chosen = null;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      SettingRow(
+        title: 'Choose a sound',
+        detail: widget.name.isEmpty
+            ? 'Built-in chime'
+            : '${widget.name} · ${(widget.bytes / 16000).toStringAsFixed(1)}s',
+        control: TextButton(
+          onPressed: widget.enabled && !busy && !kIsWeb && widget.send != null
+              ? choose
+              : null,
+          child: const Text('Choose sound'),
+        ),
+      ),
+      if (chosen != null) ...[
+        Text('${chosen!.name} · ${chosen!.duration.toStringAsFixed(1)}s'),
+        Wrap(
+          spacing: 8,
+          children: [
+            TextButton(
+              onPressed: busy
+                  ? null
+                  : () => unawaited(
+                      chosen!.preview().catchError((Object _) {
+                        if (mounted) {
+                          setState(() => error = 'Could not play the preview.');
+                        }
+                      }),
+                    ),
+              child: const Text('Preview'),
+            ),
+            TextButton(
+              onPressed: widget.enabled && !busy && widget.send != null
+                  ? () => unawaited(send())
+                  : null,
+              child: const Text('Install on device'),
+            ),
+          ],
+        ),
+      ],
+      if (widget.name.isNotEmpty)
+        TextButton(
+          onPressed: widget.enabled && !busy && widget.send != null
+              ? () => unawaited(send(restore: true))
+              : null,
+          child: const Text('Restore built-in chime'),
+        ),
+      if (busy) const LinearProgressIndicator(),
+      if (error != null)
+        Text(
+          error!,
+          style: TextStyle(color: Theme.of(context).colorScheme.error),
+        ),
+    ],
+  );
 }
 
 /// A run of rows under a caption. The grouping is presentation only, but it says something true:

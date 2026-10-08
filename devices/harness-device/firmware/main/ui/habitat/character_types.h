@@ -57,6 +57,9 @@ typedef struct {
     // Focus only: the clock_ms at which the newest unread notice arrived (0 = none). While the working scene shows,
     // the pet's alert scene plays once from then (focus.c), and ui_habitat.c flies the dot up after it.
     uint32_t notice_ms;
+    // Focus only: 1 + the custom_role_t the app asked to see (ui_character_preview), 0 = none. Shows that animation
+    // of the installed character, or the engine pet's working scene without one, whatever the agent is doing.
+    uint8_t preview;
     uint16_t ink, foreground, dim;
 } ht_character_face_t;
 

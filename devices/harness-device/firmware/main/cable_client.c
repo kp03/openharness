@@ -14,6 +14,8 @@
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "audio_capture.h"   // audio_notify_done() — the completion beep
+#include "notification_sound.h"
+#include "custom_character.h"
 #include "audio_client.h"
 #include "esp_timer.h"
 #include "fw_update.h"
@@ -220,6 +222,12 @@ static void msg_settings(cJSON **root)
                                 : cJSON_AddNullToObject(held, "companion")) &&
               cJSON_AddStringToObject(held, "voiceLang", now.voicelang) &&
               cJSON_AddNumberToObject(held,"companionProtocol",2);
+    if (ok && notification_sound_supported())
+        ok = cJSON_AddStringToObject(held,"soundName", notification_sound_name() ? notification_sound_name() : "") &&
+             cJSON_AddNumberToObject(held,"soundBytes", notification_sound_bytes());
+    if (ok && custom_character_supported())
+        ok = cJSON_AddStringToObject(held,"characterName", custom_character_name() ? custom_character_name() : "") &&
+             cJSON_AddNumberToObject(held,"characterBytes", custom_character_bytes());
     cJSON *identity=companion_json(&now.companion_details);
     if (!identity || !cJSON_AddItemToObject(held,"companionDetails",identity)) { cJSON_Delete(identity);ok=false; }
     msg_check(root, ok);
@@ -951,6 +959,8 @@ static void session_down(const char *why)
     // a serial monitor, which is exactly the situation a dropped session puts them in.
     cable_link_set_log_framing(false);
     fw_update_abort("session down");   // no more slices are coming; the running image is untouched
+    notification_sound_abort();
+    custom_character_abort();
     ESP_LOGI(TAG, "session down (%s)", why);
     ui_set_connected(false);
 }
@@ -1102,6 +1112,110 @@ static void handle_notifications(const cJSON *p)
     ui_notif_replace(rows, n);
 }
 
+/*
+ * WHAT THE OWNER INSTALLS FROM THE APP: the notification sound and the character, each offered with its size and
+ * SHA-256 (`<kind>.offer`), sent as binary slices of its own frame type, one outstanding at a time
+ * (`<kind>.progress` acknowledges the running total), committed on the last one and reported back in the
+ * settings (`<kind>.done`). `<kind>.restore` brings the built-in default back; `<kind>.cancel` abandons an upload.
+ * Refused during a firmware update or a voice turn, both of which own the flash or the codec.
+ */
+typedef struct {
+    const char *kind;
+    uint8_t frame;
+    uint32_t max_bytes;
+    bool (*offer)(const char *name, uint32_t bytes, const char *sha256);
+    bool (*chunk)(const uint8_t *data, size_t size);
+    bool (*ready)(void);
+    bool (*commit)(void);
+    bool (*restore)(void);
+    void (*abort)(void);
+    uint32_t (*written)(void);
+    void (*changed)(void);   // after a commit or restore; NULL when nothing else follows it
+    bool (*test)(char *error, size_t cap);   // the app's test button: play or show what is installed
+    const char *offer_error, *restore_error, *slice_error;
+} cable_asset_t;
+
+static bool test_sound(char *error, size_t cap)
+{
+    if (audio_notify_test()) return true;
+    snprintf(error, cap, "%s", audio_notify_is_muted() ? "The device is muted." : "The device's speaker is busy.");
+    return false;
+}
+
+static const cable_asset_t ASSETS[] = {
+    { "sound", CABLE_TYPE_SOUND, NOTIFICATION_SOUND_MAX_BYTES, notification_sound_offer, notification_sound_chunk,
+      notification_sound_ready, notification_sound_commit, notification_sound_restore, notification_sound_abort,
+      notification_sound_written, NULL, test_sound,
+      "Sound unavailable or invalid.", "Could not restore the chime.", "Sound transfer failed." },
+    { "character", CABLE_TYPE_CHARACTER, CUSTOM_CHARACTER_MAX_BYTES, custom_character_offer, custom_character_chunk,
+      custom_character_ready, custom_character_commit, custom_character_restore, custom_character_abort,
+      custom_character_written, ui_character_changed, ui_character_preview,
+      "Character unavailable or invalid.", "Could not restore the default pets.", "Character transfer failed." },
+};
+
+static cJSON *asset_reply(const cable_asset_t *a, const char *what)
+{
+    char type[24];
+    snprintf(type, sizeof type, "%s.%s", a->kind, what);
+    return msg(type);
+}
+
+static bool asset_type(const cable_asset_t *a, const char *t, const char *what)
+{
+    size_t n = strlen(a->kind);
+    return !strncmp(t, a->kind, n) && t[n] == '.' && !strcmp(t + n + 1, what);
+}
+
+static bool handle_asset_message(const cable_asset_t *a, const char *t, const cJSON *p)
+{
+    if (asset_type(a, t, "offer")) {
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(p, "size");
+        bool ok = !fw_update_active() && !audio_client_active() &&
+                  cJSON_IsNumber(size) && size->valuedouble == size->valueint &&
+                  size->valueint > 0 && (uint32_t)size->valueint <= a->max_bytes &&
+                  a->offer(str_of(p, "name"), (uint32_t)size->valueint, str_of(p, "sha256"));
+        cJSON *reply = asset_reply(a, ok ? "accept" : "error");
+        if (!ok) msg_string(&reply, "message", a->offer_error);
+        send_json(reply);
+        return true;
+    }
+    if (asset_type(a, t, "restore")) {
+        bool ok = !fw_update_active() && !audio_client_active() && a->restore();
+        if (ok && a->changed) a->changed();
+        cJSON *reply = asset_reply(a, ok ? "done" : "error");
+        if (ok) msg_settings(&reply);
+        else msg_string(&reply, "message", a->restore_error);
+        send_json(reply);
+        return true;
+    }
+    if (asset_type(a, t, "cancel")) { a->abort(); return true; }
+    if (asset_type(a, t, "test")) {
+        // Not during an update or a voice turn, which own the flash and the codec; mute is the device's own answer.
+        char error[80] = "The device is busy.";
+        bool ok = !fw_update_active() && !audio_client_active() && a->test(error, sizeof error);
+        cJSON *reply = asset_reply(a, "tested");
+        msg_bool(&reply, "ok", ok);
+        if (!ok) msg_string(&reply, "message", error);
+        send_json(reply);
+        return true;
+    }
+    return false;
+}
+
+static void handle_asset_slice(const cable_asset_t *a, const uint8_t *payload, size_t payload_len)
+{
+    bool ok = !fw_update_active() && !audio_client_active() && a->chunk(payload, payload_len);
+    bool done = ok && a->ready();
+    if (done) ok = a->commit();
+    if (!ok) a->abort();
+    if (ok && done && a->changed) a->changed();
+    cJSON *reply = asset_reply(a, ok ? (done ? "done" : "progress") : "error");
+    if (ok && done) msg_settings(&reply);
+    else if (ok) msg_number(&reply, "written", a->written());
+    else msg_string(&reply, "message", a->slice_error);
+    send_json(reply);
+}
+
 static void handle_message(const cJSON *root)
 {
     const char *t = str_of(root, "t");
@@ -1133,6 +1247,8 @@ static void handle_message(const cJSON *root)
     if (strcmp(t, "companion.set") == 0) { handle_companion_set(p); return; }
     if (strcmp(t, "companion.celebrate") == 0) { handle_companion_celebrate(p); return; }
     if (strcmp(t, "settings.set") == 0) { handle_settings_set(p); return; }
+    for (size_t i = 0; i < sizeof ASSETS / sizeof ASSETS[0]; i++)
+        if (handle_asset_message(&ASSETS[i], t, p)) return;
     if (strcmp(t, "models") == 0) { handle_models(p); return; }
     if (strcmp(t, "swarms") == 0) { handle_swarms(p); return; }
 
@@ -1165,6 +1281,7 @@ static void handle_message(const cJSON *root)
         // which reads exactly like the turn never started.
         const char *text = str_of(p, "text");
         if (agent_id) ui_project_emit(agent_id, "", "processing", text ? text : "", NULL);
+        if (agent_id && !bool_of(p, "restore") && !bool_of(p, "silent")) audio_notify_start();
         return;
     }
     if (strcmp(t, "turn.activity") == 0) {
@@ -1331,6 +1448,12 @@ static void on_frame(uint8_t version, uint8_t type, const uint8_t *payload, size
         fw_update_slice(payload, payload_len);
         return;
     }
+    for (size_t i = 0; i < sizeof ASSETS / sizeof ASSETS[0]; i++)
+        if (type == ASSETS[i].frame) {
+            s_last_rx_us = esp_timer_get_time();
+            handle_asset_slice(&ASSETS[i], payload, payload_len);
+            return;
+        }
     if (type != CABLE_TYPE_JSON) {
         // PCM travels the other way; anything else is a peer that knows a payload kind this build does not.
         s_unknown++;

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -58,6 +59,24 @@ class _DevicesTabState extends State<DevicesTab> {
   Widget build(BuildContext context) => DevicesScreen(
     controller: controller,
     onRefresh: widget.notifier.refreshDevices,
+    onSound: (device, name, bytes) => widget.notifier.setHostDeviceSound(
+      device.machineId,
+      device.status.id!,
+      name,
+      bytes,
+    ),
+    onCharacter: (device, name, bytes) =>
+        widget.notifier.setHostDeviceCharacter(
+          device.machineId,
+          device.status.id!,
+          name,
+          bytes,
+        ),
+    onTest: (device, kind) => widget.notifier.testHostDeviceAsset(
+      kind,
+      device.machineId,
+      device.status.id!,
+    ),
   );
 }
 
@@ -67,10 +86,17 @@ class DevicesScreen extends StatefulWidget {
     required this.controller,
     this.openShop,
     this.onRefresh,
+    this.onSound,
+    this.onCharacter,
+    this.onTest,
   });
   final DevicesController controller;
   final Future<bool> Function(Uri)? openShop;
   final Future<void> Function()? onRefresh;
+  final Future<String?> Function(HarnessDevice, String, Uint8List?)? onSound;
+  final Future<String?> Function(HarnessDevice, String, Uint8List?)?
+  onCharacter;
+  final Future<String?> Function(HarnessDevice, DeviceAsset)? onTest;
   @override
   State<DevicesScreen> createState() => _DevicesScreenState();
 }
@@ -325,6 +351,9 @@ class _DevicesScreenState extends State<DevicesScreen> {
                               key: ValueKey(selected.key),
                               device: selected,
                               controller: widget.controller,
+                              onSound: widget.onSound,
+                              onCharacter: widget.onCharacter,
+                              onTest: widget.onTest,
                             );
                             if (constraints.maxWidth < 850 ||
                                 MediaQuery.textScalerOf(context).scale(1) >

@@ -1,7 +1,10 @@
 /** Devices DSH tools use the same owned-machine bridge as Desktop. No serial or credential access. */
 import { randomUUID } from 'node:crypto'
 import type { ClientSocket } from '../lib/clientSocket.js'
+import { readFile } from 'node:fs/promises'
 import { deviceSettingsPatchSchema } from '../lib/harnessDevices.js'
+import { LONG_ANSWERS } from '../core/api.js'
+import { assetName, buildCharacter, CHARACTER_ROLES, decodePng, prepareSound, type CharacterRole, type SheetChoice } from './assets.js'
 
 export interface DevicesClientDeps {
   port: number
@@ -13,6 +16,7 @@ export interface DevicesClientDeps {
 }
 
 export function deviceRequest(deps: DevicesClientDeps, machineId: string, type: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const wait = 12_000 + (LONG_ANSWERS.devices?.[type] ?? 0)
   return new Promise((resolve, reject) => {
     const socket = deps.connect(`ws://127.0.0.1:${deps.port}/api/local-ws`)
     const requestId = randomUUID()
@@ -24,7 +28,7 @@ export function deviceRequest(deps: DevicesClientDeps, machineId: string, type: 
       try { socket.close() } catch { /* already closed */ }
       if (error) reject(error); else resolve(reply!)
     }
-    const timer = setTimeout(() => finish(new Error('This computer did not answer in time.')), 12_000)
+    const timer = setTimeout(() => finish(new Error('This computer did not answer in time.')), wait)
     socket.on('open', () => socket.send(JSON.stringify({ type: 'machine_select', payload: { machineId, localProtocolVersion: 1, tool: true } })))
     socket.on('error', error => finish(error))
     socket.on('close', code => finish(new Error(code === 4404 ? 'Link this computer in Machines first.' : 'The computer disconnected.')))
@@ -46,6 +50,13 @@ export function deviceRequest(deps: DevicesClientDeps, machineId: string, type: 
 export const DEVICES_USAGE = `harness hardware — your Harness hardware across computers
   list [--json]                                      read owned computers and devices
   set --machine ID --device ID --patch JSON [--json]  change only the supplied settings
+  sound [--machine ID] [--device ID] (FILE | --restore)
+                                                     install any audio file as the finished-task sound
+  character [--machine ID] [--device ID] (--thinking PNG --tool PNG --idle PNG | --restore)
+            [--name NAME] [--row N] [--frame WxH] [--ms N]
+                                                     install sprite sheets as the device's character;
+                                                     --thinking-row, --tool-ms ... set one animation
+--machine defaults to this computer and --device to its only plugged-in device.
 Offline computers never receive queued changes. A write is complete only when confirmed.`
 
 interface Host { machineId: string; name: string; online: boolean }
@@ -78,6 +89,7 @@ export async function devicesCommand(argv: string[], deps: DevicesClientDeps): P
   const words = argv.filter(word => word !== '--json')
   const command = words.shift() ?? 'list'
   if (command === 'help' || command === '--help') return { help: DEVICES_USAGE }
+  if (command === 'sound' || command === 'character') return assetCommand(command, words, deps)
   if (command !== 'list' && command !== 'set') throw new Error(DEVICES_USAGE)
   const options: Record<string, string> = {}
   if (command === 'list' && words.length) throw new Error(DEVICES_USAGE)
@@ -132,4 +144,75 @@ export async function runDevicesCommand(argv: string[], deps: DevicesClientDeps)
     console.log(JSON.stringify({ error: error instanceof Error ? error.message : 'Device request failed.', confirmed: false }))
     return 1
   }
+}
+
+/** `sound` and `character`: convert here, send to the owning computer, and report what the device then holds. */
+async function assetCommand(kind: 'sound' | 'character', words: string[], deps: DevicesClientDeps): Promise<Record<string, unknown>> {
+  const options: Record<string, string> = {}
+  const files: string[] = []
+  let restore = false
+  const valued = ['--machine', '--device', '--name', '--row', '--frame', '--ms',
+    ...CHARACTER_ROLES.flatMap(role => [`--${role}`, `--${role}-row`, `--${role}-frame`, `--${role}-ms`])]
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!
+    if (word === '--restore') restore = true
+    else if (valued.includes(word) && words[i + 1] && !(word in options)) options[word] = words[++i]!
+    else if (!word.startsWith('--') && kind === 'sound') files.push(word)
+    else throw new Error(DEVICES_USAGE)
+  }
+  const roles = CHARACTER_ROLES.filter(role => options[`--${role}`])
+  if (kind === 'sound' ? restore === (files.length === 1) || files.length > 1 : restore === roles.length > 0)
+    throw new Error(DEVICES_USAGE)
+
+  let name = '', data: string | null = null, summary: Record<string, unknown> = {}
+  if (kind === 'sound' && !restore) {
+    const sound = await prepareSound(files[0]!)
+    name = options['--name'] ?? sound.name
+    data = Buffer.from(sound.bytes).toString('base64')
+    summary = { seconds: Math.round(sound.bytes.length / 160) / 100 }
+  } else if (kind === 'character' && !restore) {
+    const number = (text: string | undefined, what: string) => {
+      if (text === undefined) return undefined
+      if (!/^\d+$/.test(text)) throw new Error(`${what} must be a whole number.`)
+      return Number(text)
+    }
+    const sheets: Partial<Record<CharacterRole, SheetChoice>> = {}
+    for (const role of roles) {
+      const frame = options[`--${role}-frame`] ?? options['--frame']
+      const size = frame?.match(/^(\d+)x(\d+)$/)
+      if (frame && !size) throw new Error('--frame is WIDTHxHEIGHT in pixels, for example 64x64.')
+      sheets[role] = {
+        image: decodePng(await readFile(options[`--${role}`]!)),
+        row: number(options[`--${role}-row`] ?? options['--row'], '--row'),
+        stepMs: number(options[`--${role}-ms`] ?? options['--ms'], '--ms'),
+        ...(size ? { frameWidth: Number(size[1]), frameHeight: Number(size[2]) } : {}),
+      }
+    }
+    const built = buildCharacter(sheets)
+    name = options['--name'] ?? assetName(options[`--${roles[0]}`]!, 'Custom character')
+    data = Buffer.from(built.bytes).toString('base64')
+    summary = { roles: built.roles, colours: built.colours, bytes: built.bytes.length }
+  }
+  if (name.length > 31 || !/^[\x20-\x7e]*$/.test(name)) throw new Error('--name is at most 31 plain characters.')
+
+  const hosts = await ownedHosts(deps)
+  const request = deps.request ?? ((id, type, payload) => deviceRequest(deps, id, type, payload))
+  const machineId = options['--machine'] ?? await deps.machineId()
+  const host = hosts.find(item => item.machineId === machineId)
+  if (!host) throw new Error('That computer is not owned by this account.')
+  if (!host.online) throw new Error('That computer is offline. Nothing was sent.')
+  let id = options['--device']
+  if (!id) {
+    const listed = await request(host.machineId, 'harness_devices_list')
+    const status = listed.status as Record<string, unknown> & { devices?: Record<string, unknown>[] } | undefined
+    const attached = (status?.devices ?? (status ? [status] : [])).filter(device => device.attached === true)
+    if (attached.length !== 1)
+      throw new Error(attached.length ? 'Several devices are plugged in. Choose one with --device.' : 'No device is plugged into that computer.')
+    id = String(attached[0]!.id)
+  }
+  const reply = await request(host.machineId, `harness_device_${kind}`, { id, name, data })
+  if (reply.error || reply.ok !== true) return { ...reply, ...summary, installed: false }
+  const settings = observed(reply, id)?.settings as Record<string, unknown> | undefined
+  return { ok: true, machineId: host.machineId, id, ...summary,
+    installed: restore ? 'default' : settings?.[`${kind}Name`] ?? name }
 }

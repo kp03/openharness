@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
 import { CableDecoder, CableType, encodeCableFrame } from './cableFrame.js'
-import { CableSession, type CableAgent, type CableHost, type CableMachine, type CablePort } from './cableSession.js'
+import { ASSET_TEST_TIMEOUT_MS, CableSession, type CableAgent, type CableHost, type CableMachine, type CablePort } from './cableSession.js'
 import { DialLog } from './dialLog.js'
 
 /** A port whose two ends are both in this process. */
@@ -633,6 +633,104 @@ describe('cable session', () => {
     await settle()
     expect(seen.at(-1)).toMatchObject({ settings: quieter })
     await session.stop()
+  })
+
+  it('uploads a sound one acknowledged slice at a time and keeps older firmware gated', async () => {
+    const { session, port } = await connect()
+    const settings = { ...companionSettings, soundName: '', soundBytes: 0 }
+    try {
+      expect(await session.setNotificationSound('Bell', Buffer.alloc(1))).toMatchObject({ ok: false })
+      port.say({ t: 'hello', product: 'harness', mac: 'aa:bb', fw: '0.0.90', proto: 4, settings })
+      await vi.waitFor(() => expect(port.types()).toContain('agents.end'))
+      const bytes = Buffer.alloc(5000, 0x7f)
+      const upload = session.setNotificationSound('Bell', bytes)
+      await vi.waitFor(() => expect(port.types()).toContain('sound.offer'))
+      expect(port.frames.filter((frame) => frame[3] === CableType.Sound)).toHaveLength(0)
+      port.say({ t: 'sound.accept' })
+      await vi.waitFor(() => expect(port.frames.filter((frame) => frame[3] === CableType.Sound)).toHaveLength(1))
+      expect(port.frames.find((frame) => frame[3] === CableType.Sound)?.length).toBe(4096 + 8)
+      port.say({ t: 'sound.progress', written: 4096 })
+      await vi.waitFor(() => expect(port.frames.filter((frame) => frame[3] === CableType.Sound)).toHaveLength(2))
+      port.say({ t: 'sound.done', settings: { ...settings, soundName: 'Bell', soundBytes: 5000 } })
+      expect(await upload).toEqual({ ok: true })
+      const restore = session.setNotificationSound('', null)
+      await vi.waitFor(() => expect(port.types()).toContain('sound.restore'))
+      port.say({ t: 'sound.done', settings })
+      expect(await restore).toEqual({ ok: true })
+    } finally { await session.stop() }
+  })
+
+  it('uploads a character on its own frame type and ignores replies meant for the other asset', async () => {
+    const { session, port } = await connect()
+    const settings = { ...companionSettings, soundName: '', soundBytes: 0, characterName: '', characterBytes: 0 }
+    const slices = () => port.frames.filter((frame) => frame[3] === CableType.Character)
+    // Firmware that holds a sound but not a character is told so, before anything is sent.
+    const older = await connect()
+    try {
+      older.port.say({ t: 'hello', product: 'harness', mac: 'aa:cc', fw: '0.0.90', proto: 4, settings: { ...companionSettings, soundName: '', soundBytes: 0 } })
+      await vi.waitFor(() => expect(older.port.types()).toContain('agents.end'))
+      expect(await older.session.installAsset('character', 'Knight', Buffer.alloc(10))).toMatchObject({ ok: false, error: expect.stringContaining('updated firmware') })
+      expect(older.port.types()).not.toContain('character.offer')
+    } finally { await older.session.stop() }
+    try {
+      port.say({ t: 'hello', product: 'harness', mac: 'aa:bb', fw: '0.0.90', proto: 4, settings })
+      await vi.waitFor(() => expect(port.types()).toContain('agents.end'))
+      expect(await session.installAsset('character', 'Knight', Buffer.alloc(0x80000))).toMatchObject({ ok: false, error: 'Character is too large.' })
+
+      const upload = session.installAsset('character', 'Knight', Buffer.alloc(9000, 3))
+      await vi.waitFor(() => expect(port.types()).toContain('character.offer'))
+      expect(await session.setNotificationSound('Bell', Buffer.alloc(1))).toEqual({ ok: false, error: 'The device is busy.' })
+      port.say({ t: 'sound.accept' })   // not this transfer's
+      port.say({ t: 'character.accept' })
+      await vi.waitFor(() => expect(slices()).toHaveLength(1))
+      port.say({ t: 'character.progress', written: 4096 })
+      await vi.waitFor(() => expect(slices()).toHaveLength(2))
+      port.say({ t: 'character.progress', written: 8192 })
+      await vi.waitFor(() => expect(slices()).toHaveLength(3))
+      expect(slices()[2]!.length).toBe(9000 - 8192 + 8)
+      port.say({ t: 'character.done', settings: { ...settings, characterName: 'Knight', characterBytes: 9000 } })
+      expect(await upload).toEqual({ ok: true })
+
+      // An acknowledgement of the wrong running total abandons the transfer and tells the dial.
+      const wrong = session.installAsset('character', 'Knight', Buffer.alloc(5000, 3))
+      await vi.waitFor(() => expect(port.types().filter((type) => type === 'character.offer')).toHaveLength(2))
+      port.say({ t: 'character.accept' })
+      await vi.waitFor(() => expect(slices()).toHaveLength(4))
+      port.say({ t: 'character.progress', written: 100 })
+      expect(await wrong).toMatchObject({ ok: false, error: expect.stringContaining('character bytes') })
+      expect(port.types()).toContain('character.cancel')
+
+      const refused = session.installAsset('character', '', null)
+      await vi.waitFor(() => expect(port.types()).toContain('character.restore'))
+      port.say({ t: 'character.error', message: 'Could not restore the default pets.' })
+      expect(await refused).toEqual({ ok: false, error: 'Could not restore the default pets.' })
+    } finally { await session.stop() }
+  })
+
+  it('tests the installed sound and character, passing the dial\'s refusal and timing out on older firmware', async () => {
+    const { session, port } = await connect()
+    const settings = { ...companionSettings, soundName: '', soundBytes: 0, characterName: 'Knight', characterBytes: 9000 }
+    try {
+      expect(await session.testAsset('sound')).toMatchObject({ ok: false, error: expect.stringContaining('updated firmware') })
+      port.say({ t: 'hello', product: 'harness', mac: 'aa:bb', fw: '0.0.90', proto: 4, settings })
+      await vi.waitFor(() => expect(port.types()).toContain('agents.end'))
+      const sound = session.testAsset('sound')
+      await vi.waitFor(() => expect(port.types()).toContain('sound.test'))
+      expect(await session.testAsset('character')).toEqual({ ok: false, error: 'A test is already running.' })
+      port.say({ t: 'character.tested', ok: true })   // not this test's
+      port.say({ t: 'sound.tested', ok: true })
+      expect(await sound).toEqual({ ok: true })
+      const character = session.testAsset('character')
+      await vi.waitFor(() => expect(port.types()).toContain('character.test'))
+      port.say({ t: 'character.tested', ok: false, message: 'Choose the Focus face on the device to see a character.' })
+      expect(await character).toEqual({ ok: false, error: 'Choose the Focus face on the device to see a character.' })
+      vi.useFakeTimers()
+      try {
+        const silent = session.testAsset('sound')
+        await vi.advanceTimersByTimeAsync(ASSET_TEST_TIMEOUT_MS)
+        expect(await silent).toMatchObject({ ok: false, error: expect.stringContaining('updated firmware') })
+      } finally { vi.useRealTimers() }
+    } finally { await session.stop() }
   })
 
   it('answers a repeat hello WITHOUT re-pushing the list', async () => {

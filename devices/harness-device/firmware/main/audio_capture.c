@@ -1,5 +1,6 @@
 #include "audio_capture.h"
 #include "config_store.h"
+#include "notification_sound.h"
 #include "audio_probe.h"
 #include "board_pins.h"
 #include "board/board_i2c.h"
@@ -52,28 +53,52 @@ bool audio_notify_set_muted(bool muted)
     return config_save_muted(muted);
 }
 
-// BEEP_COUNT 80ms ~2kHz tones with 60ms gaps. Generate only the next 20ms,
-// retaining the identical waveform without reserving 11 KiB for an idle sound.
-#define BEEP_SAMPLES (AUDIO_SAMPLE_RATE * 80 / 1000)
-#define GAP_SAMPLES  (AUDIO_SAMPLE_RATE * 60 / 1000)
-#define BEEP_COUNT   3
-#define TONE_SAMPLES (BEEP_SAMPLES * BEEP_COUNT + GAP_SAMPLES * (BEEP_COUNT - 1))
+// Two distinct, quiet cues: a rising pair when work starts and a short
+// three-note resolution for a finished summary. Only one 20 ms PCM block is
+// kept in RAM, and the existing mute/microphone rules apply to both.
+typedef struct { uint16_t hz, ms, gap_ms; } note_t;
+static const note_t start_notes[] = {{660, 65, 30}, {880, 85, 0}};
+static const note_t done_notes[] = {{784, 75, 45}, {988, 75, 45}, {1175, 110, 0}};
+enum { CUE_START = 1, CUE_DONE = 2 };
 #define TONE_BLOCK_SAMPLES (AUDIO_SAMPLE_RATE / 50)
 static int16_t s_tone[TONE_BLOCK_SAMPLES];
 
-static void render_tone(size_t offset, size_t count)
+static size_t cue_samples(const note_t *notes, size_t n)
 {
-    const int half = AUDIO_SAMPLE_RATE / 2000 / 2;   // half-period of a ~2kHz square wave
-    const int16_t amp = 6000;
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) total += (size_t)(notes[i].ms + notes[i].gap_ms) * AUDIO_SAMPLE_RATE / 1000;
+    return total;
+}
+
+static void render_tone(const note_t *notes, size_t n, size_t offset, size_t count)
+{
     for (size_t i = 0; i < count; i++) {
-        size_t phase = (offset + i) % (BEEP_SAMPLES + GAP_SAMPLES);
-        s_tone[i] = phase < BEEP_SAMPLES
-            ? (((phase / (half > 0 ? half : 1)) & 1) ? amp : -amp) : 0;
+        size_t at = offset + i;
+        s_tone[i] = 0;
+        for (size_t j = 0; j < n; j++) {
+            size_t len = (size_t)notes[j].ms * AUDIO_SAMPLE_RATE / 1000;
+            size_t span = len + (size_t)notes[j].gap_ms * AUDIO_SAMPLE_RATE / 1000;
+            if (at < span) {
+                if (at < len) {
+                    // A 5 ms edge avoids a click at each note boundary.
+                    size_t edge = AUDIO_SAMPLE_RATE / 200;
+                    size_t gain = at < edge ? at : len - at < edge ? len - at : edge;
+                    size_t half = AUDIO_SAMPLE_RATE / notes[j].hz / 2;
+                    int amp = (int)(4500 * gain / edge);
+                    s_tone[i] = ((at / (half ? half : 1)) & 1) ? amp : -amp;
+                }
+                break;
+            }
+            at -= span;
+        }
     }
 }
 
-static void play_beep(void)
+static void play_beep(unsigned cue)
 {
+    const note_t *notes = cue == CUE_START ? start_notes : done_notes;
+    size_t n = cue == CUE_START ? sizeof start_notes / sizeof start_notes[0] : sizeof done_notes / sizeof done_notes[0];
+    size_t total = cue_samples(notes, n);
     if (!s_spk || audio_notify_is_muted() || atomic_load(&s_capture_requested)) return;
     if (xSemaphoreTake(s_codec_lock, 0) != pdTRUE) return;
     if (audio_notify_is_muted() || atomic_load(&s_capture_requested)) {
@@ -84,27 +109,38 @@ static void play_beep(void)
     if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) { xSemaphoreGive(s_codec_lock); ESP_LOGW(TAG, "spk open failed"); return; }
     if (!audio_notify_is_muted()) {
         esp_codec_dev_set_out_vol(s_spk, 100);
-        // Let mute or a microphone start interrupt a tone within one 20ms write.
-        for (size_t offset=0; offset<TONE_SAMPLES;) {
+        // The installed sound replaces the completion tones only; the start cue stays built in.
+        int slot;
+        uint32_t sound_bytes;
+        bool custom = cue == CUE_DONE && notification_sound_playback_begin(&slot, &sound_bytes);
+        if (custom) total = sound_bytes;
+        // Let mute or microphone capture interrupt playback within one 20 ms write.
+        for (size_t offset=0; offset<total;) {
             if (audio_notify_is_muted() || atomic_load(&s_capture_requested)) break;
-            size_t count=TONE_SAMPLES-offset;
+            size_t count=total-offset;
             if (count>TONE_BLOCK_SAMPLES) count=TONE_BLOCK_SAMPLES;
-            render_tone(offset,count);
+            if (custom) {
+                uint8_t encoded[TONE_BLOCK_SAMPLES];
+                if (!notification_sound_read(slot, offset, encoded, count)) break;
+                for (size_t i=0; i<count; i++) s_tone[i]=notification_sound_decode(encoded[i]);
+            } else render_tone(notes,n,offset,count);
             if (esp_codec_dev_write(s_spk, s_tone, (int)(count*sizeof s_tone[0])) != ESP_CODEC_DEV_OK) break;
             offset+=count;
         }
+        if (custom) notification_sound_playback_end();
     }
     esp_codec_dev_close(s_spk);
     xSemaphoreGive(s_codec_lock);
-    ESP_LOGI(TAG, "beep");
+    ESP_LOGI(TAG, "cue %s", cue == CUE_START ? "start" : "done");
 }
 
 static void beep_task(void *arg)
 {
     (void)arg;
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        play_beep();
+        uint32_t cue = 0;
+        if (xTaskNotifyWait(0, UINT32_MAX, &cue, portMAX_DELAY) == pdTRUE)
+            play_beep(cue);
     }
 }
 
@@ -121,6 +157,7 @@ static void notify_init_failed(const char *why)
 
 void audio_notify_init(void)
 {
+    notification_sound_init();
 #ifdef DEVICE_CREATURE_GALLERY
     atomic_store_explicit(&s_muted, true, memory_order_relaxed);
     ESP_LOGI(TAG, "notifications muted (local ASCII gallery)");
@@ -169,16 +206,26 @@ void audio_notify_init(void)
     ESP_LOGI(TAG, "speaker (ES8311) ready");
 }
 
-void audio_notify_done(void)
+static void queue_cue(unsigned cue)
 {
-    static atomic_uint last_ms;
+    static atomic_uint last_start_ms, last_done_ms;
     if (!s_beep_task || audio_notify_is_muted()) return;
-    uint32_t previous = atomic_load(&last_ms);
+    atomic_uint *last_ms = cue == CUE_START ? &last_start_ms : &last_done_ms;
+    uint32_t previous = atomic_load(last_ms);
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (now - previous < 1000) return;
+    if (now - previous < (cue == CUE_START ? 500u : 1000u)) return;
     // A concurrent completion owns the notification if it won this exchange.
-    if (!atomic_compare_exchange_strong(&last_ms, &previous, now)) return;
-    xTaskNotifyGive(s_beep_task);
+    if (!atomic_compare_exchange_strong(last_ms, &previous, now)) return;
+    xTaskNotify(s_beep_task, cue, eSetValueWithOverwrite);
+}
+
+void audio_notify_start(void) { queue_cue(CUE_START); }
+void audio_notify_done(void) { queue_cue(CUE_DONE); }
+bool audio_notify_test(void)
+{
+    if (!s_beep_task || audio_notify_is_muted() || atomic_load(&s_capture_requested)) return false;
+    xTaskNotify(s_beep_task, CUE_DONE, eSetValueWithOverwrite);
+    return true;
 }
 
 static bool capture_init_failed(const char *why)

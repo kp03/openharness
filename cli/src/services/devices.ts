@@ -22,7 +22,7 @@ import { env } from '../config/env.js'
 import { DEVICES_REQUESTS, type CoreApi, type CorePorts, type DevicesPort, type RouteAnswer, type SendResult, type ServiceRequests, type WindowFocus } from '../core/api.js'
 import { CableFleet, testDialDiscovery, type CableFleetOptions } from '../cable/cableFleet.js'
 import { cableEventFor, cableQuestionCloseFor, cableQuestionFor, DaemonCableHost } from '../cable/cableHost.js'
-import { CableSession } from '../cable/cableSession.js'
+import { CableSession, type DeviceAssetKind } from '../cable/cableSession.js'
 import { DialLog } from '../cable/dialLog.js'
 import { DialVerdicts } from '../cable/dialPortVerdicts.js'
 import { WindowForm } from '../cable/windowForm.js'
@@ -318,8 +318,13 @@ export function startDevices(core: CoreApi, ports: CorePorts, deps: DevicesDeps)
     status: () => cableHost.currentDialStatus(),
     revision: () => revision,
     set: (id: string, patch: Parameters<CableFleet['setSettings']>[1]) => cable.setSettings(id, patch),
+    sound: (id: string, name: string, bytes: Uint8Array | null) => cable.setNotificationSound(id, name, bytes),
+    character: (id: string, name: string, bytes: Uint8Array | null) => cable.setCharacter(id, name, bytes),
+    test: (id: string, kind: DeviceAssetKind) => cable.testAsset(id, kind),
   }
   const answer = (type: string) => (payload: Record<string, unknown>, asker: { owner: boolean }) =>
     asker.owner ? harnessDevicesRequest(tab, type, payload) : { error: 'OWNER_REQUIRED' }
-  return { harness_devices_list: answer('harness_devices_list'), harness_device_settings: answer('harness_device_settings') }
+  return { harness_devices_list: answer('harness_devices_list'), harness_device_settings: answer('harness_device_settings'),
+    harness_device_sound: answer('harness_device_sound'), harness_device_character: answer('harness_device_character'),
+    harness_device_test: answer('harness_device_test') }
 }

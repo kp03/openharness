@@ -58,7 +58,7 @@ export function admitRelayedPairFrame(frame: { type?: unknown; payload?: unknown
 }
 export const encryptDownFrame = (type: string): boolean =>
   isEncryptedDownType(type) || MACHINE_REQUESTS.has(type) || FLEET_REQUESTS.has(type) || SHARE_REQUEST_TYPES.has(type) || VIEWER_DOWN_TYPES.has(type)
-  || PAIR_REQUESTS.has(type) || type === PLATE_REQUEST || TEAM_REQUEST_TYPES.has(type)
+  || PAIR_REQUESTS.has(type) || type === PLATE_REQUEST || TEAM_REQUEST_TYPES.has(type) || type === 'harness_device_sound' || type === 'harness_device_character' || type === 'harness_device_test'
 /** Client→daemon requests that older daemons took in the clear and no longer do. A client seals them
  * only for a daemon whose e2e_welcome says `strictDown` — an older one would never open the envelope
  * and would read the request as empty. A daemon that says `strictDown` refuses them unsealed. */
@@ -83,6 +83,9 @@ const QUESTION_RESULT = 'question_response_result'
  * plain reply it always had.
  */
 const SEALED_REPLIES = new Set([
+  'harness_device_sound_result',
+  'harness_device_character_result',
+  'harness_device_test_result',
   // What a pane runs and where: its folder, pid and tty.
   'terminal_info_result',
   // The rest of what a machine tells the client that asked about it: its Store harnesses, its engines

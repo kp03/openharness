@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../state/app_state.dart';
@@ -53,6 +55,24 @@ class SettingsBody extends StatelessWidget {
         builder: (context, _) => DevicesSection(
           dial: notifier.dial,
           onDeviceSettings: notifier.setDeviceSettings,
+          onDeviceSound: (id, name, Uint8List? bytes) {
+            final machineId = notifier.localMachineState?.machine.machineId;
+            return machineId == null
+                ? Future<String?>.value('This computer is unavailable.')
+                : notifier.setHostDeviceSound(machineId, id, name, bytes);
+          },
+          onDeviceCharacter: (id, name, Uint8List? bytes) {
+            final machineId = notifier.localMachineState?.machine.machineId;
+            return machineId == null
+                ? Future<String?>.value('This computer is unavailable.')
+                : notifier.setHostDeviceCharacter(machineId, id, name, bytes);
+          },
+          onDeviceTest: (id, kind) {
+            final machineId = notifier.localMachineState?.machine.machineId;
+            return machineId == null
+                ? Future<String?>.value('This computer is unavailable.')
+                : notifier.testHostDeviceAsset(kind, machineId, id);
+          },
           showCompanion: (experimentalFeatures ?? notifier.experimentalFeatures)
               .enabled(ExperimentalFeature.focusBarCreature),
         ),

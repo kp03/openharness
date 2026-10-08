@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:harness/settings/sections/cabled_device_card.dart';
+import 'package:harness/state/app_state.dart' show DeviceAsset;
 import 'package:harness/state/dial_status.dart';
 
 const _round = DeviceSettings(
@@ -204,6 +205,151 @@ void main() {
     await _tap(tester, const ValueKey('device-quiet-AA:01'));
     expect(sent, isEmpty);
   });
+
+  testWidgets(
+    'custom sound controls follow the device report and address restore to one robot',
+    (tester) async {
+      final calls = <String>[];
+      const reported = DeviceSettings(
+        brightness: 60,
+        character: 0,
+        face: 466,
+        muted: false,
+        quiet: false,
+        straightTitle: false,
+        focusFace: false,
+        scrollReversed: false,
+        round: true,
+        voiceLang: 'en',
+        soundName: 'Bell',
+        soundBytes: 16000,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: CabledDeviceCard(
+                devices: const [
+                  DialStatus(attached: true, id: 'AA:01', settings: reported),
+                  DialStatus(
+                    attached: false,
+                    id: 'BB:02',
+                    mac: 'bb:02',
+                    settings: reported,
+                  ),
+                ],
+                onChanged: (_, _) {},
+                onSound: (id, name, bytes) async {
+                  calls.add(
+                    '$id:$name:${bytes == null ? 'restore' : 'upload'}',
+                  );
+                  return null;
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(find.textContaining('Bell · 1.0s'), findsOneWidget);
+      await tester.ensureVisible(find.text('Restore built-in chime'));
+      await tester.tap(find.text('Restore built-in chime'));
+      await tester.pump();
+      expect(calls, ['AA:01::restore']);
+      await tester.ensureVisible(find.textContaining('bb:02'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('bb:02'));
+      await tester.pumpAndSettle();
+      final restore = tester.widget<TextButton>(
+        find.widgetWithText(TextButton, 'Restore built-in chime'),
+      );
+      expect(restore.onPressed, isNull);
+    },
+  );
+
+  testWidgets(
+    'test buttons ask the plugged-in robot to play its sound and show its character, and show its refusal',
+    (tester) async {
+      final calls = <String>[];
+      const reported = DeviceSettings(
+        brightness: 60,
+        character: 2,
+        face: 466,
+        muted: false,
+        quiet: false,
+        straightTitle: false,
+        focusFace: false,
+        scrollReversed: false,
+        round: true,
+        voiceLang: 'en',
+        soundName: '',
+        soundBytes: 0,
+        characterName: 'Knight',
+        characterBytes: 9000,
+      );
+      Widget card(List<DialStatus> devices) => MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: CabledDeviceCard(
+              devices: devices,
+              onChanged: (_, _) {},
+              onTest: (id, kind) async {
+                calls.add('$id:${kind.name}');
+                return kind == DeviceAsset.sound
+                    ? null
+                    : 'Choose the Focus face on the device to see a character.';
+              },
+            ),
+          ),
+        ),
+      );
+      await tester.pumpWidget(
+        card(const [
+          DialStatus(attached: true, id: 'AA:01', settings: reported),
+        ]),
+      );
+      for (final key in ['sound-test-AA:01', 'character-test-AA:01']) {
+        final button = find.descendant(
+          of: find.byKey(ValueKey(key)),
+          matching: find.byType(OutlinedButton),
+        );
+        await tester.ensureVisible(button);
+        await tester.pumpAndSettle();
+        await tester.tap(button);
+        await tester.pumpAndSettle();
+      }
+      expect(calls, ['AA:01:sound', 'AA:01:character']);
+      expect(
+        find.text('Choose the Focus face on the device to see a character.'),
+        findsOneWidget,
+      );
+
+      // Unplugged: readable, and nothing to test.
+      await tester.pumpWidget(
+        card(const [
+          DialStatus(attached: false, id: 'AA:01', settings: reported),
+        ]),
+      );
+      for (final key in ['sound-test-AA:01', 'character-test-AA:01']) {
+        final button = tester.widget<OutlinedButton>(
+          find.descendant(
+            of: find.byKey(ValueKey(key)),
+            matching: find.byType(OutlinedButton),
+          ),
+        );
+        expect(button.onPressed, isNull);
+      }
+    },
+  );
+
+  testWidgets(
+    'firmware that reports no sound or character gets no test buttons',
+    (tester) async {
+      await _pump(tester, const [
+        DialStatus(attached: true, id: 'AA:01', settings: _round),
+      ]);
+      expect(find.text('Test on device'), findsNothing);
+    },
+  );
 
   testWidgets('two robots on one desk get a picker, and the rows follow it', (
     tester,

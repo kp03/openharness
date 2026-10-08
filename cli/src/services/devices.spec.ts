@@ -15,7 +15,7 @@ import type { Fleet, FleetDeps } from './fleet.js'
 const seen = vi.hoisted(() => ({
   host: null as unknown as CableHostWiring,
   dial: null as unknown as { onDialStatus(status: unknown): void },
-  cable: null as unknown as { args: unknown[]; calls: Array<[string, unknown[]]>; setSettings: (id: string, patch: unknown) => Promise<{ ok: boolean; error?: string }> },
+  cable: null as unknown as { args: unknown[]; calls: Array<[string, unknown[]]>; setSettings: (id: string, patch: unknown) => Promise<{ ok: boolean; error?: string }>; setNotificationSound: (id: string, name: string, bytes: Uint8Array | null) => Promise<{ ok: boolean; error?: string }>; setCharacter: (id: string, name: string, bytes: Uint8Array | null) => Promise<{ ok: boolean; error?: string }> },
   bridges: {} as Record<string, { wiring: Record<string, (...args: unknown[]) => unknown>; calls: Array<[string, unknown[]]> }>,
   fleet: null as null | { deps: FleetDeps; events: ((event: FleetEvent) => void) | null; fail: boolean },
   voice: { sessions: vi.fn(), connected: vi.fn(), shutdown: vi.fn() },
@@ -52,6 +52,8 @@ vi.mock('../cable/cableFleet.js', async (real) => {
     summary = recorder('summary')
     turnError = recorder('turnError')
     setSettings = vi.fn(async (id: string, _patch: unknown) => (id === 'usb' ? { ok: true } : { ok: false, error: 'That device is not plugged into this computer.' }))
+    setNotificationSound = vi.fn(async (id: string, _name: string, _bytes: Uint8Array | null) => (id === 'usb' ? { ok: true } : { ok: false, error: 'That device is not plugged into this computer.' }))
+    setCharacter = vi.fn(async (id: string, _name: string, _bytes: Uint8Array | null) => (id === 'usb' ? { ok: true } : { ok: false, error: 'That device is not plugged into this computer.' }))
   }
   return { ...actual, CableFleet: FakeCable }
 })
@@ -482,5 +484,13 @@ describe('the Devices tab', () => {
     expect(await requests.harness_devices_list({}, owner)).toMatchObject({ protocol: 1, revision: 1, status: { attached: true } })
     expect(await requests.harness_device_settings({ id: 'usb', patch: { brightness: 35 } }, owner)).toMatchObject({ ok: true, revision: 1 })
     expect(seen.cable.setSettings).toHaveBeenCalledWith('usb', { brightness: 35 })
+    expect(await requests.harness_device_sound({ id: 'usb', name: 'Bell', data: 'fw==' }, { local: false, owner: false })).toEqual({ error: 'OWNER_REQUIRED' })
+    seen.dial.onDialStatus({ attached: true, devices: [{ id: 'usb', attached: true, settings: { brightness: 80, soundName: '', soundBytes: 0 } }] })
+    expect(await requests.harness_device_sound({ id: 'usb', name: 'Bell', data: 'fw==' }, owner)).toMatchObject({ ok: true })
+    expect(seen.cable.setNotificationSound).toHaveBeenCalledWith('usb', 'Bell', Buffer.from([127]))
+    expect(await requests.harness_device_character({ id: 'usb', name: 'Knight', data: 'fw==' }, owner)).toMatchObject({ error: 'UNSUPPORTED' })
+    seen.dial.onDialStatus({ attached: true, devices: [{ id: 'usb', attached: true, settings: { brightness: 80, soundName: '', soundBytes: 0, characterName: '', characterBytes: 0 } }] })
+    expect(await requests.harness_device_character({ id: 'usb', name: 'Knight', data: 'fw==' }, owner)).toMatchObject({ ok: true })
+    expect(seen.cable.setCharacter).toHaveBeenCalledWith('usb', 'Knight', Buffer.from([127]))
   })
 })

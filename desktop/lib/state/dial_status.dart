@@ -31,6 +31,10 @@ class DeviceSettings {
     this.companion,
     this.companionProtocol,
     this.companionDetails,
+    this.soundName,
+    this.soundBytes,
+    this.characterName,
+    this.characterBytes,
   });
 
   final int brightness;
@@ -44,6 +48,14 @@ class DeviceSettings {
   final String? companion;
   final int? companionProtocol;
   final DialCompanion? companionDetails;
+
+  /// Null means this firmware cannot install sounds; empty means the built-in chime.
+  final String? soundName;
+  final int? soundBytes;
+
+  /// Null means this firmware cannot install a character; empty means the engine pets.
+  final String? characterName;
+  final int? characterBytes;
 
   /// Last-reported values for the local device library. Restoring these never
   /// marks a device connected or sends settings back to it.
@@ -59,6 +71,10 @@ class DeviceSettings {
     'round': round,
     'voiceLang': voiceLang,
     if (followCompanion != null) 'followCompanion': followCompanion,
+    if (soundName != null) 'soundName': soundName,
+    if (soundBytes != null) 'soundBytes': soundBytes,
+    if (characterName != null) 'characterName': characterName,
+    if (characterBytes != null) 'characterBytes': characterBytes,
   };
 
   /// Read with `is`, never `as`, and refused whole when a field is missing: a default here is a value
@@ -98,6 +114,18 @@ class DeviceSettings {
       scrollReversed: scroll,
       round: round,
       voiceLang: lang,
+      soundName: value['soundName'] is String
+          ? value['soundName'] as String
+          : null,
+      soundBytes: value['soundBytes'] is int
+          ? value['soundBytes'] as int
+          : null,
+      characterName: value['characterName'] is String
+          ? value['characterName'] as String
+          : null,
+      characterBytes: value['characterBytes'] is int
+          ? value['characterBytes'] as int
+          : null,
       followCompanion: value['followCompanion'] is bool
           ? value['followCompanion'] as bool
           : null,

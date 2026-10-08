@@ -15,6 +15,9 @@ const int e2eVersion = 1;
 const Set<String> encryptedDownTypes = {
   'harness_devices_list',
   'harness_device_settings',
+  'harness_device_sound',
+  'harness_device_character',
+  'harness_device_test',
   'team',
   'team_delivery',
   'harness_share_list',

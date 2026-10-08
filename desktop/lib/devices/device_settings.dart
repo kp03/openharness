@@ -1,4 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:file_selector/file_selector.dart';
 
 import '../shared/theme/app_icons.dart';
 import '../shared/widgets/app_dialog.dart';
@@ -6,6 +10,10 @@ import '../shared/widgets/app_select_field.dart';
 import '../shared/widgets/setting_row.dart';
 import '../widgets/desktop_chrome.dart';
 import 'devices_controller.dart';
+import '../state/app_state.dart' show DeviceAsset;
+import 'character_picker.dart';
+import 'device_test_button.dart';
+import 'notification_sound_import.dart';
 
 /// Face ids belong to the firmware (character.h), not screen dimensions.
 /// Add future faces here only when production firmware can actually select them.
@@ -18,21 +26,79 @@ class DeviceSettingsPanel extends StatefulWidget {
     super.key,
     required this.device,
     required this.controller,
+    this.onSound,
+    this.onCharacter,
+    this.onTest,
   });
   final HarnessDevice device;
   final DevicesController controller;
+  final Future<String?> Function(HarnessDevice, String, Uint8List?)? onSound;
+  final Future<String?> Function(HarnessDevice, String, Uint8List?)?
+  onCharacter;
+  final Future<String?> Function(HarnessDevice, DeviceAsset)? onTest;
   @override
   State<DeviceSettingsPanel> createState() => _DeviceSettingsPanelState();
 }
 
 class _DeviceSettingsPanelState extends State<DeviceSettingsPanel> {
   double? _brightness;
+  PreparedDeviceSound? _chosenSound;
+  bool _soundBusy = false;
+  String? _soundError;
+
+  Future<void> _chooseSound() async {
+    try {
+      final file = await openFile();
+      if (file == null) return;
+      setState(() {
+        _soundBusy = true;
+        _soundError = null;
+      });
+      final sound = await prepareDeviceSound(file.path);
+      if (mounted) {
+        setState(() => _chosenSound = sound);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _soundError = error is FormatException
+              ? error.message
+              : 'Could not prepare this sound.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _soundBusy = false);
+    }
+  }
+
+  Future<void> _sendSound({bool restore = false}) async {
+    final send = widget.onSound;
+    final chosen = _chosenSound;
+    if (send == null || (!restore && chosen == null)) return;
+    setState(() {
+      _soundBusy = true;
+      _soundError = null;
+    });
+    final error = await send(
+      widget.device,
+      restore ? '' : chosen!.name,
+      restore ? null : chosen!.bytes,
+    );
+    if (!mounted) return;
+    setState(() {
+      _soundBusy = false;
+      _soundError = error;
+      if (error == null) _chosenSound = null;
+    });
+  }
 
   @override
   void didUpdateWidget(DeviceSettingsPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.device.key != widget.device.key || !widget.device.canEdit) {
       _brightness = null;
+      _chosenSound = null;
+      _soundError = null;
     }
   }
 
@@ -115,6 +181,99 @@ class _DeviceSettingsPanelState extends State<DeviceSettingsPanel> {
             onChanged: enabled ? (value) => change({'muted': !value}) : null,
           ),
         ),
+        if (settings.soundName != null) ...[
+          const SizedBox(height: 10),
+          SettingRow(
+            title: 'Notification sound',
+            detail: settings.soundName!.isEmpty
+                ? 'Built-in chime'
+                : '${settings.soundName} · ${(settings.soundBytes ?? 0) / 16000}s',
+            control: TextButton(
+              onPressed:
+                  enabled && !_soundBusy && !kIsWeb && widget.onSound != null
+                  ? _chooseSound
+                  : null,
+              child: const Text('Choose sound'),
+            ),
+          ),
+          if (_chosenSound != null) ...[
+            Text(
+              '${_chosenSound!.name} · ${_chosenSound!.duration.toStringAsFixed(1)}s',
+              style: DesktopChrome.metadata(),
+            ),
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton(
+                  onPressed: _soundBusy
+                      ? null
+                      : () => unawaited(
+                          _chosenSound!.preview().catchError((Object _) {
+                            if (mounted) {
+                              setState(
+                                () =>
+                                    _soundError = 'Could not play the preview.',
+                              );
+                            }
+                          }),
+                        ),
+                  child: const Text('Preview'),
+                ),
+                TextButton(
+                  onPressed: enabled && !_soundBusy && widget.onSound != null
+                      ? () => unawaited(_sendSound())
+                      : null,
+                  child: const Text('Install on device'),
+                ),
+              ],
+            ),
+          ],
+          if (settings.soundName!.isNotEmpty)
+            TextButton(
+              onPressed: enabled && !_soundBusy && widget.onSound != null
+                  ? () => unawaited(_sendSound(restore: true))
+                  : null,
+              child: const Text('Restore built-in chime'),
+            ),
+          DeviceTestButton(
+            key: ValueKey('sound-test-${widget.device.key}'),
+            title: 'Play on the robot',
+            detail: 'The sound it plays when a turn finishes. Muted robots stay silent.',
+            enabled: enabled && !_soundBusy,
+            test: widget.onTest == null
+                ? null
+                : () => widget.onTest!(widget.device, DeviceAsset.sound),
+          ),
+          if (_soundBusy) const LinearProgressIndicator(),
+          if (_soundError != null)
+            Text(
+              _soundError!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+        ],
+        if (settings.characterName != null) ...[
+          const SizedBox(height: 10),
+          DeviceCharacterPicker(
+            key: ValueKey('character-picker-${widget.device.key}'),
+            name: settings.characterName!,
+            bytes: settings.characterBytes ?? 0,
+            enabled: enabled,
+            send: widget.onCharacter == null
+                ? null
+                : (name, data) =>
+                      widget.onCharacter!(widget.device, name, data),
+          ),
+          DeviceTestButton(
+            key: ValueKey('character-test-${widget.device.key}'),
+            title: 'Show on the robot',
+            detail:
+                'Plays each of its animations on the screen for a few seconds.',
+            enabled: enabled,
+            test: widget.onTest == null
+                ? null
+                : () => widget.onTest!(widget.device, DeviceAsset.character),
+          ),
+        ],
         const SizedBox(height: 10),
         SettingRow(
           title: 'Reverse scrolling',

@@ -30,6 +30,9 @@ set(BOARD_SRCS
     "last_words.c"
     "fw_update.c"
     "audio_capture.c"
+    "notification_sound.c"
+    "asset_store.c"
+    "custom_character.c"
     "audio_client_habitat.c"
     "audio_probe.c"
     "voice_buffer.c"
@@ -116,6 +119,7 @@ idf_component_register(
 # snprintf() is bounded (it truncates, never overflows), but -O2 enables a noisy
 # format-truncation analysis that errors on safe same-size copies. Keep it as a warning, not error.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format-truncation)
+
 
 if(DEVICE_HABITAT_ORANGE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE DEVICE_HABITAT_ORANGE=1)

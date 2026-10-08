@@ -13,6 +13,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 
+cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize="${SANITIZERS:-undefined,bounds}" \
+   -I "$here/fakes" -I "$here/../main" -o "$out/test_notification_sound" \
+   "$here/test_notification_sound.c" "$here/../main/notification_sound.c" "$here/../main/asset_store.c"
+"$out/test_notification_sound"
+cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize="${SANITIZERS:-undefined,bounds}" \
+   -I "$here/fakes" -I "$here/../main" -I "$here/../main/ui/habitat" -o "$out/test_custom_character" \
+   "$here/test_custom_character.c" "$here/../main/custom_character.c" "$here/../main/asset_store.c"
+"$out/test_custom_character"
+
 # The vectors are generated, not written. Regenerating first means a stale file cannot pass as agreement.
 python3 "$here/../scripts/gen_cable_vectors.py" --check
 python3 "$here/../scripts/gen_tux_moods.py" --check
@@ -23,7 +32,7 @@ cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize="${SANITIZERS:-undefined,bou
    -o "$out/test_character" "$here/test_character.c" \
    "$here/../main/ui/habitat/character.c" "$here/../main/ui/habitat/illustrated.c" "$here/../main/ui/habitat/character_motion.c" \
    "$here/../main/ui/habitat/character_layout.c" "$here/../main/ui/habitat/tux.c" \
-   "$here/../main/ui/habitat/focus.c" "$here/../main/ui/habitat/lvgl_fonts.c" "$here/../main/ui/habitat/lvgl_icons.c" "$here/../main/ui/habitat/focus_marks.c" "$here/../main/ui/habitat/focus_faces.c" "$here/../main/ui/habitat/pets.c" \
+   "$here/../main/ui/habitat/focus.c" "$here/../main/ui/habitat/lvgl_fonts.c" "$here/../main/ui/habitat/lvgl_icons.c" "$here/../main/ui/habitat/focus_marks.c" "$here/../main/ui/habitat/focus_faces.c" "$here/../main/ui/habitat/pets.c" "$here/fakes/custom_character_none.c" \
    "$here/../main/ui/habitat/octopus.c" "$here/../main/ui/habitat/octopus_font.c" \
    "$here/../main/ui/habitat/ascii_clip.c" \
    "$here/../main/ui/habitat/terminal.c" "$here/../main/ui/habitat/fonts.c"

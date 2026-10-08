@@ -372,6 +372,11 @@ bool ui_companion_celebrate(const ui_companion_t *identity, const char *kind, co
 // A local change the app has not heard about yet (a factory reset, a pattern just drawn). Wakes the
 // cable's reporter; safe from any task.
 void ui_settings_changed(void);
+// An installed or restored character: the face switches to it with the display locked, then redraws.
+void ui_character_changed(void);
+// The app's test button: the Focus face plays the installed character's animations for a few seconds. False, with
+// one line in `error`, when the face is not Focus or the display is asleep.
+bool ui_character_preview(char *error, size_t cap);
 void ui_selection_state(const struct cJSON *payload);
 void ui_draft_state(const struct cJSON *p);
 void ui_voice_draft(const struct cJSON *p);

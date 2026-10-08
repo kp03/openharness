@@ -22,6 +22,7 @@ code = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include "audio_capture.h"
+static void notification_sound_init(void) {}
 #define DEVICE_HABITAT 1
 #define ESP_OK 0
 #define pdPASS 1

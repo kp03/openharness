@@ -6,5 +6,8 @@
 nvs,      data, nvs,     0x9000,   0x6000
 otadata,  data, ota,     0xf000,   0x2000
 phy_init, data, phy,     0x11000,  0x1000
-ota_0,    app,  ota_0,   0x20000,  0x7E0000
-ota_1,    app,  ota_1,   0x800000, 0x7E0000
+# Each app slot is 7 MB, about twice today's image. The rest holds what the owner installs
+# from the app (notification sound, character), which a normal OTA update leaves in place.
+ota_0,    app,  ota_0,   0x20000,  0x700000
+ota_1,    app,  ota_1,   0x720000, 0x700000
+assets,   data,  0x40,    0xE20000, 0x1E0000

@@ -55,7 +55,7 @@ export interface ServiceLinksOptions {
   /** How long a routed request may wait for its service before it is answered SERVICE_UNAVAILABLE. */
   timeoutMs?: number
   /** Longer waits for the answers that take longer, by service and then by type (core/api.ts
-   *  `LONG_ANSWERS`): a grid command, grid's set-up, a harness's install. */
+   *  `LONG_ANSWERS`): a grid command, grid's set-up, a harness's install, a device sound or character transfer. */
   waits?: Readonly<Record<string, Readonly<Record<string, number>>>>
   /** The services whose process runs only once asked for: the experiments (core/api.ts `EXPERIMENTS`) and the
    *  devices (core/devicesWake.ts). A request for one that has not connected yet asks for it (`want`) and waits

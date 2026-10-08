@@ -1,7 +1,9 @@
 #include "focus.h"
 #include "pets.h"
+#include "../../custom_character.h"
 #include "focus_faces.h"
 #include "theme.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -167,16 +169,46 @@ static const ht_pet_t *pet_for(const ht_character_face_t *f)
     return NULL;
 }
 
+// The status line names a thought rather than a tool: "Thinking", "Reasoning", "Planning", or the bare
+// "Working…" a turn starts with before anything runs.
+static bool status_thinking(const char *activity)
+{
+    if (!activity || !*activity || !strncmp(activity, "Working", 7)) return true;
+    static const char *const words[] = {"think", "reason", "plan"};
+    for (const char *p = activity; *p; p++)
+        for (unsigned w = 0; w < sizeof words / sizeof words[0]; w++) {
+            size_t i = 0;
+            while (words[w][i] && tolower((unsigned char)p[i]) == words[w][i]) i++;
+            if (!words[w][i]) return true;
+        }
+    return false;
+}
+
 /*
- * THE WORKING SCENE: a pet with one (Claude's cooking Clawd) plays it, large, in place of the small
- * pet and the centred working line, while it is working on a plain working line — not asking, not a
- * recap, not the listening meter, not held. NULL otherwise.
+ * THE WORKING SCENE: the owner's installed character plays its thinking animation, or its tool one while a
+ * tool runs. Otherwise an engine pet with a scene plays its own. Neither appears for a question, recap,
+ * voice screen or held face.
  */
 static const ht_pet_scene_t *working_scene(const ht_character_face_t *f, const char *recap)
 {
+    if (f->preview && !f->voice) {
+        const ht_pet_scene_t *shown = custom_character_scene((custom_role_t)(f->preview - 1));
+        const ht_pet_t *pet = shown ? NULL : pet_for(f);
+        if (!shown && pet) shown = pet->working_scene;
+        if (shown) return shown;
+    }
+    if (pet_holds(f) || f->mood == HT_CHARACTER_LISTENING || f->voice ||
+        pet_state(f, recap) != HT_PET_WORKING) return NULL;
+    const ht_pet_scene_t *custom = custom_character_scene(status_thinking(f->activity) ? CUSTOM_ROLE_THINKING : CUSTOM_ROLE_TOOL);
+    if (custom) return custom;
     const ht_pet_t *pet = pet_for(f);
-    if (!pet || !pet->working_scene || pet_holds(f) || f->mood == HT_CHARACTER_LISTENING) return NULL;
-    return pet_state(f, recap) == HT_PET_WORKING ? pet->working_scene : NULL;
+    return pet ? pet->working_scene : NULL;
+}
+// The installed character's idle loop in the engine pet's place once a turn is finished or resting; a question keeps the pet.
+static const ht_pet_scene_t *idle_scene(const ht_character_face_t *f, const char *recap)
+{
+    if (f->voice || (!pet_holds(f) && pet_state(f, recap) == HT_PET_ASKING)) return NULL;
+    return custom_character_scene(CUSTOM_ROLE_IDLE);
 }
 bool ht_focus_scene_shown(const ht_character_face_t *f, const char *recap)
 {
@@ -194,7 +226,7 @@ static const ht_pet_scene_t *alert_scene(const ht_character_face_t *f, const cha
 {
     const ht_pet_scene_t *work = working_scene(f, recap);
     const ht_pet_t *pet = pet_for(f);
-    if (!work || !pet->alert_scene || !f->notice_ms) return NULL;
+    if (!work || custom_character_owns(work) || !pet || !pet->alert_scene || !f->notice_ms) return NULL;
     const ht_pet_scene_t *a = pet->alert_scene;
     uint32_t age = f->clock_ms - f->notice_ms;
     if (age >= (uint32_t)a->steps * a->step_ms) return NULL;
@@ -204,7 +236,8 @@ static const ht_pet_scene_t *alert_scene(const ht_character_face_t *f, const cha
 uint32_t ht_focus_alert_ms(const ht_character_face_t *f, const char *recap)
 {
     const ht_pet_t *pet = pet_for(f);
-    if (!working_scene(f, recap) || !pet->alert_scene) return 0;
+    const ht_pet_scene_t *work = working_scene(f, recap);
+    if (!work || custom_character_owns(work) || !pet || !pet->alert_scene) return 0;
     return (uint32_t)pet->alert_scene->steps * pet->alert_scene->step_ms;
 }
 void ht_focus_alert_from(const ht_character_face_t *f, int *x, int *y)
@@ -366,7 +399,12 @@ static uint32_t scene_next_ms(const ht_pet_scene_t *sc, unsigned level, uint32_t
 uint32_t ht_focus_pet_next_ms(const ht_character_face_t *f, const char *recap)
 {
     const ht_pet_t *pet = pet_for(f);
-    if (!pet || pet_holds(f)) return 0;
+    if (pet_holds(f)) return 0;
+    const ht_pet_scene_t *custom = working_scene(f, recap);
+    if (custom_character_owns(custom)) return scene_next_ms(custom, 0, f->clock_ms);
+    const ht_pet_scene_t *idle = custom ? NULL : idle_scene(f, recap);
+    if (idle) return scene_next_ms(idle, 0, f->clock_ms);
+    if (!pet) return 0;
     if (f->voice) {
         const ht_pet_scene_t *ls = listening_scene(f);
         unsigned level = f->pose.level >= HT_PET_SCENE_LEVELS ? HT_PET_SCENE_LEVELS - 1 : f->pose.level;
@@ -768,6 +806,17 @@ void ht_focus_face(ht_scene_t *s, const ht_character_face_t *f, uint8_t frame, u
         int sx, sy;
         scene_origin(scene, 4, &sx, &sy);
         ht_cell_sprite(s, sx, sy + scene_dy(scene, 0, f->clock_ms), scene_frame(scene, 0, f->clock_ms));
+    } else if (idle_scene(f, recap)) {
+        // The installed character resting where the pet stands, scaled (in eighths, at most 1x) to fit between the name and
+        // the recap; still on its first frame while the face is held.
+        const ht_pet_scene_t *idle = idle_scene(f, recap);
+        const ht_cell_frame_t *fr = pet_holds(f) ? &idle->frames[0] : scene_frame(idle, 0, f->clock_ms);
+        int room = below - TITLE_BOTTOM - 8, full = fr->rows * fr->cell;
+        int z = room * 8 / full;
+        if (z > 8) z = 8;
+        if (z < 1) z = 1;
+        int pw = (fr->cols * fr->cell * z + 7) / 8, ph = (full * z + 7) / 8;
+        ht_cell_sprite_zoom(s, (HT_WIDTH - pw) / 2, TITLE_BOTTOM + (below - TITLE_BOTTOM - ph) / 2, fr, (unsigned)z);
     } else if (pet) {
         // The engine's pet, centred in the mark's box, lifted by its step's hop.
         bool hold = pet_holds(f);

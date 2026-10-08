@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:harness/shared/theme/app_icons.dart';
 import 'package:flutter/material.dart';
@@ -17,6 +18,7 @@ import '../../shared/widgets/skeleton.dart';
 import '../../shared/theme/app_theme.dart' as grid;
 import '../../shared/widgets/section_scaffold.dart';
 import '../../state/dial_status.dart';
+import '../../state/app_state.dart' show DeviceAsset;
 import 'cabled_device_card.dart';
 
 class DevicesSection extends StatefulWidget {
@@ -25,6 +27,9 @@ class DevicesSection extends StatefulWidget {
     this.cli,
     this.dial,
     this.onDeviceSettings,
+    this.onDeviceSound,
+    this.onDeviceCharacter,
+    this.onDeviceTest,
     this.showCompanion = false,
   });
   final bool showCompanion;
@@ -36,6 +41,11 @@ class DevicesSection extends StatefulWidget {
 
   /// Send one robot a settings patch. See AppNotifier.setDeviceSettings.
   final void Function(String id, Map<String, Object?> patch)? onDeviceSettings;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onDeviceSound;
+  final Future<String?> Function(String id, String name, Uint8List? bytes)?
+  onDeviceCharacter;
+  final Future<String?> Function(String id, DeviceAsset kind)? onDeviceTest;
   @override
   State<DevicesSection> createState() => _DevicesSectionState();
 }
@@ -306,6 +316,9 @@ class _DevicesSectionState extends State<DevicesSection> {
                   devices: dial.devices,
                   showCompanion: widget.showCompanion,
                   onChanged: widget.onDeviceSettings ?? (_, _) {},
+                  onSound: widget.onDeviceSound,
+                  onCharacter: widget.onDeviceCharacter,
+                  onTest: widget.onDeviceTest,
                 ),
               ),
             if (_loading)

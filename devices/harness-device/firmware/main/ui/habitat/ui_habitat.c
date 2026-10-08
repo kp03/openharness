@@ -1,5 +1,6 @@
 // Habitat: bounded state + text runs. Protocol callbacks update data, never create widgets.
 #include <limits.h>
+#include "../../custom_character.h"
 #include "runtime.h"
 #include "scroll.h"
 #include "workspace.h"
@@ -264,6 +265,14 @@ static ht_gesture_t gesture;
 static ht_character_t character;
 static ht_character_id_t device_skin, desktop_companion = HT_CHARACTER_COUNT;
 static bool follow_companion = true, companion_celebrating;
+// The app's character test (ui_character_preview): each role's animation for PREVIEW_ROLE_MS, from preview_began.
+#define PREVIEW_ROLE_MS 2000u
+static bool character_previewing;
+static uint32_t preview_began;
+static uint8_t preview_role(uint32_t now)
+{
+    return character_previewing ? (uint8_t)(1 + ((now - preview_began) / PREVIEW_ROLE_MS) % CUSTOM_ROLES) : 0;
+}
 /*
  * FOCUS ONLY, until the companion skins are finished (owner, 2026-09-30). The device build defines
  * HABITAT_FOCUS_ONLY (main/CMakeLists.txt): whatever skin or companion the flash holds, the glass
@@ -984,6 +993,12 @@ static void surface_tick(uint32_t now)
     if (companion_celebrating && (now-celebration_began>=2400 || s.view!=HOME || s.quiet || !follow_companion || display_is_asleep() || character_mood()==HT_CHARACTER_ATTENTION)) {
         companion_celebrating=false; select_companion(); change();
     }
+    if (character_previewing) {
+        static uint8_t shown;
+        if (now - preview_began >= CUSTOM_ROLES * PREVIEW_ROLE_MS || s.view != HOME || display_is_asleep()) {
+            character_previewing = false; shown = 0; change();
+        } else if (preview_role(now) != shown) { shown = preview_role(now); change(); }
+    }
     if (s.view == TABS && !display_is_asleep()) {
         if (ht_tab_carousel_tick(&tab_carousel, now)) change();
         tabs_sync();
@@ -1218,6 +1233,7 @@ static void render_home(ht_scene_t *f)
         .asking = a && is_question(a->id),
         .clock_ms = (s.quiet || display_is_asleep()) ? 0 : clock,   // the pet's loop
         .notice_ms = bell ? s.notice_ms : 0,
+        .preview = preview_role(clock),
         .straight_title = s.straight_title,
         .footer_action = carry.active || carry.error[0] || visit.available,
         .ink = FG, .foreground = FG, .dim = DIM,
@@ -3551,6 +3567,13 @@ void ui_settings_changed(void)
 {
     cable_client_report_settings();
 }
+void ui_character_changed(void)
+{
+    display_lock();
+    custom_character_reload();
+    change();
+    display_unlock();
+}
 bool ui_set_companion_identity(const ui_companion_t *identity)
 {
     ht_character_id_t id=ht_character_companion(identity?identity->id:NULL);
@@ -3574,6 +3597,19 @@ bool ui_set_companion(const char *species)
     snprintf(identity.name,sizeof identity.name,"%s",species);
     snprintf(identity.version,sizeof identity.version,"2.0");
     return ui_set_companion_identity(&identity);
+}
+bool ui_character_preview(char *error, size_t cap)
+{
+    display_lock();
+    const char *refused = character.id != HT_CHARACTER_FOCUS ? "Choose the Focus face on the device to see a character."
+                        : display_is_asleep() ? "The device's screen is asleep." : NULL;
+    if (!refused) {
+        if (s.view != HOME) view(HOME);
+        character_previewing = true; preview_began = ms(); change();
+    }
+    display_unlock();
+    if (refused) snprintf(error, cap, "%s", refused);
+    return !refused;
 }
 bool ui_companion_celebrate(const ui_companion_t *identity,const char *kind,const char *token)
 {

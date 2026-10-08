@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { DialVerdicts } from './dialPortVerdicts.js'
 import { findDialPorts, portInUse, SerialLink, type DialPort } from './serial.js'
 import { isUsbConsoleUser } from './usbConsoleUser.js'
-import type { CableSession, CableHost, CablePort, DialStatus, PortOpener } from './cableSession.js'
+import type { CableSession, CableHost, CablePort, DeviceAssetKind, DialStatus, PortOpener } from './cableSession.js'
 import type { DialLog } from './dialLog.js'
 
 type Surface = Pick<CableSession, keyof CableSession>
@@ -306,6 +306,29 @@ export class CableFleet {
       this.host.log(`cable: ${entry.port.path} settings: ${String(error)}`)
       return { ok: false, error: 'The device did not take the change.' }
     }
+  }
+
+  async setNotificationSound(id: string, name: string, bytes: Uint8Array | null): Promise<{ ok: boolean; error?: string }> {
+    return this.installAsset(id, 'sound', name, bytes)
+  }
+
+  async setCharacter(id: string, name: string, bytes: Uint8Array | null): Promise<{ ok: boolean; error?: string }> {
+    return this.installAsset(id, 'character', name, bytes)
+  }
+
+  /** Play the device's notification sound, or show its character, for the app's test button. */
+  async testAsset(id: string, kind: DeviceAssetKind): Promise<{ ok: boolean; error?: string }> {
+    const entry = this.entries.get(id)
+    if (!entry?.status.attached) return { ok: false, error: 'That device is unplugged.' }
+    if (entry.status.updating) return { ok: false, error: 'The device is updating firmware.' }
+    return entry.session.testAsset(kind)
+  }
+
+  private async installAsset(id: string, kind: DeviceAssetKind, name: string, bytes: Uint8Array | null): Promise<{ ok: boolean; error?: string }> {
+    const entry = this.entries.get(id)
+    if (!entry?.status.attached) return { ok: false, error: 'That device is unplugged.' }
+    if (entry.status.updating) return { ok: false, error: 'The device is updating firmware.' }
+    return entry.session.installAsset(kind, name, bytes)
   }
 
   private async send<K extends keyof Surface>(name: K, ...args: Surface[K] extends (...args: infer A) => unknown ? A : never): Promise<void> {

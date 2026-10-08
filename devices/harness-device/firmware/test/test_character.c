@@ -1,5 +1,6 @@
 // The public character contract: reaction state, every mood/size, swapping, and
 // DMA damage replay. Uses the same immutable assets and renderer as the board.
+#include "../main/custom_character.h"
 #include "../main/ui/habitat/character.h"
 #include "../main/ui/habitat/pets.h"
 #include "../main/ui/habitat/focus.h"
@@ -824,6 +825,20 @@ static void focus_face(void)
         ht_character_face(&scene, &c, &other, 0xffff, "");
         assert(scene.runs[1].sprite.pixels == ht_icon_engine56[2].px && scene.runs[1].sprite.width == 56);
         assert(!ht_focus_pet_next_ms(&other, ""));
+
+        // The app's character test: a resting face plays the working scene while previewing, and not otherwise.
+        // Without an installed character (this build's fake) the pet's own scene stands in for it.
+        if (pet->working_scene) {
+            ht_character_face_t rest = {.recipient = "x", .engine = eng, .activity = "", .status = "", .hint = "",
+                .detail = "", .mood = HT_CHARACTER_IDLE, .clock_ms = 1};
+            assert(!ht_focus_scene_shown(&rest, ""));
+            for (uint8_t role = 1; role <= 3; role++) {
+                rest.preview = role;
+                assert(ht_focus_scene_shown(&rest, ""));
+            }
+            rest.voice = true;
+            assert(!ht_focus_scene_shown(&rest, ""));
+        }
 
         // The time the face next changes: a later clock, where the drawn frame or hop really differs,
         // and nothing differs one ms before it.

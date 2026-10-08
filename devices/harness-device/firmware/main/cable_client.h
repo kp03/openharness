@@ -74,7 +74,7 @@ const char *cable_fw_version(void);
 // foreign, never as "probably ours". Absence has to mean no.
 #define CABLE_PRODUCT "harness"
 
-#define CABLE_PROTO_VERSION 3   // 3: + question.close (a question answered on another client)
+#define CABLE_PROTO_VERSION 4   // 4: + device notification sound and character upload
 
 // Most agents the dial holds at once — the size of the list this file hands the UI.
 //

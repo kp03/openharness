@@ -76,6 +76,8 @@
 #define CABLE_TYPE_PCM  0x02   // one chunk of 16-bit mono PCM, device → daemon, during a voice turn
 #define CABLE_TYPE_FW   0x03   // one slice of a firmware image, daemon → device only
 #define CABLE_TYPE_LOG  0x04   // one ESP_LOG line, device → daemon, raw bytes (no JSON escaping)
+#define CABLE_TYPE_SOUND 0x05 // mu-law sound slice, daemon → device only
+#define CABLE_TYPE_CHARACTER 0x06 // custom character slice, daemon → device only
 
 // CRC-16/CCITT-FALSE — poly 0x1021, init 0xFFFF, no reflection, no final xor.
 //

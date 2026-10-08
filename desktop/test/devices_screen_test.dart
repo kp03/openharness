@@ -11,6 +11,7 @@ import 'package:harness/devices/device_hosts.dart';
 import 'package:harness/devices/devices_controller.dart';
 import 'package:harness/devices/devices_screen.dart';
 import 'package:harness/shared/theme/app_theme.dart' as grid;
+import 'package:harness/state/app_state.dart' show DeviceAsset;
 import 'package:harness/state/dial_status.dart';
 
 import 'devices_controller_test.dart' show deviceStatus, report;
@@ -388,6 +389,79 @@ void main() {
         hasLength(1),
         reason: 'Inspecting the current face never writes',
       );
+      await tester.pumpWidget(const SizedBox());
+      controller.dispose();
+      dial.dispose();
+    },
+  );
+
+  testWidgets(
+    'the selected device tests its own sound and character, and says why it could not',
+    (tester) async {
+      final dial = DialState();
+      final controller = DevicesController(
+        dial: dial,
+        accountId: 'a',
+        sendSettings: (_, _) async => true,
+      );
+      await controller.load();
+      final capable = DialStatus.fromJson({
+        'id': 'a',
+        'mac': '00:11:22:33:a',
+        'attached': true,
+        'fw': '0.0.101',
+        'settings': {
+          'brightness': 80,
+          'character': 2,
+          'face': 466,
+          'round': true,
+          'muted': false,
+          'quiet': false,
+          'straightTitle': true,
+          'focusFace': false,
+          'scrollReversed': false,
+          'voiceLang': 'en',
+          'soundName': '',
+          'soundBytes': 0,
+          'characterName': 'Knight',
+          'characterBytes': 9000,
+        },
+      });
+      report(dial, [capable]);
+      final calls = <String>[];
+      tester.view.physicalSize = const Size(1280, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: DevicesScreen(
+              controller: controller,
+              onTest: (device, kind) async {
+                calls.add('${device.status.id}:${kind.name}');
+                return kind == DeviceAsset.sound
+                    ? 'The device is muted.'
+                    : null;
+              },
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final key = controller.devices.single.key;
+      for (final name in ['sound-test-$key', 'character-test-$key']) {
+        final button = find.descendant(
+          of: find.byKey(ValueKey(name)),
+          matching: find.byType(OutlinedButton),
+        );
+        await tester.ensureVisible(button);
+        await tester.pumpAndSettle();
+        await tester.tap(button);
+        await tester.pumpAndSettle();
+      }
+      expect(calls, ['a:sound', 'a:character']);
+      expect(find.text('The device is muted.'), findsOneWidget);
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
       dial.dispose();

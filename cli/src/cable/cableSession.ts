@@ -32,7 +32,7 @@ import { QuestionInbox, type ReviewedAnswer, type AnswerReceipt, type QuestionSp
 import { notificationReadToken, type UnreadNotification } from '../lib/notificationRead.js'
 
 /** Bumped when the VOCABULARY changes. Separate from the frame version, which is the envelope. */
-export const CABLE_PROTO_VERSION = 3   // 3: + question.close (a question answered on another client)
+export const CABLE_PROTO_VERSION = 4   // 4: + device notification sound and character upload
 
 const PING_EVERY_MS = 5_000
 /** No bytes of any kind for this long → the handle is dead. Longer than the dial's own 15 s window, so a
@@ -388,10 +388,28 @@ export interface DeviceSettings {
   companion?: string | null
   companionProtocol?: number
   companionDetails?: CompanionIdentity | null
+  /** Present only on firmware that supports installing a notification sound. Empty is the built-in chime. */
+  soundName?: string
+  soundBytes?: number
+  /** Present only on firmware that supports installing a character. Empty is the engine pets. */
+  characterName?: string
+  characterBytes?: number
 }
 
+/**
+ * What the owner installs on a device from the app, and the most bytes its slot on the device holds (the
+ * firmware's NOTIFICATION_SOUND_MAX_BYTES and CUSTOM_CHARACTER_MAX_BYTES: a slot less its 80-byte header).
+ */
+export const DEVICE_ASSETS = {
+  sound: { frame: CableType.Sound, maxBytes: 0x40000 - 80, timeoutMs: 60_000 },
+  character: { frame: CableType.Character, maxBytes: 0x80000 - 80, timeoutMs: 120_000 },
+} as const
+export type DeviceAssetKind = keyof typeof DEVICE_ASSETS
+/** How long a test waits for `<kind>.tested`: the dial answers at once, so silence means older firmware. */
+export const ASSET_TEST_TIMEOUT_MS = 3_000
+
 /** The fields a `settings.set` may name. Absent means unchanged — see handle_settings_set on the device. */
-export type DeviceSettingsPatch = Partial<Omit<DeviceSettings, 'round' | 'face' | 'companion' | 'companionProtocol' | 'companionDetails'>>
+export type DeviceSettingsPatch = Partial<Omit<DeviceSettings, 'round' | 'face' | 'companion' | 'companionProtocol' | 'companionDetails' | 'soundName' | 'soundBytes' | 'characterName' | 'characterBytes'>>
 
 /** What a window needs to draw the device row. `updating` names the version on its way over. */
 export interface DialStatus {
@@ -481,6 +499,12 @@ function readSettings(value: unknown): DeviceSettings | undefined {
     scrollReversed: raw.scrollReversed as boolean,
     round: raw.round as boolean,
     voiceLang: raw.voiceLang,
+    ...(typeof raw.soundName === 'string' && typeof raw.soundBytes === 'number' &&
+        Number.isInteger(raw.soundBytes) && raw.soundBytes >= 0 && raw.soundBytes <= DEVICE_ASSETS.sound.maxBytes
+      ? { soundName: raw.soundName, soundBytes: raw.soundBytes } : {}),
+    ...(typeof raw.characterName === 'string' && typeof raw.characterBytes === 'number' &&
+        Number.isInteger(raw.characterBytes) && raw.characterBytes >= 0 && raw.characterBytes <= DEVICE_ASSETS.character.maxBytes
+      ? { characterName: raw.characterName, characterBytes: raw.characterBytes } : {}),
     ...(raw.companionProtocol === 2 ? {companionProtocol:2, companionDetails:readCompanionIdentity(raw.companionDetails)} : {}),
     ...(typeof raw.followCompanion === 'boolean' &&
         (raw.companion === null || typeof raw.companion === 'string')
@@ -570,6 +594,10 @@ export class CableSession {
 
   /** A firmware transfer in flight, and the versions already tried this session. */
   private transfer: FirmwareTransfer | null = null
+  /** A sound or character on its way to the dial: one slice outstanding, acknowledged by its running total. */
+  private assetTest: { kind: DeviceAssetKind; finish: (result: { ok: boolean; error?: string }) => void; timer: NodeJS.Timeout } | null = null
+  private assetTransfer: { kind: DeviceAssetKind; bytes: Uint8Array; offset: number; finish: (error?: string) => void;
+    timer: NodeJS.Timeout } | null = null
   /** `<mac>:<version>` already offered on this port. The durable, cross-port guard is `mayOffer`. */
   private offered = new Set<string>()
 
@@ -854,6 +882,8 @@ export class CableSession {
     // The dial keeps its running image; the half-written slot is erased again by the next accepted offer.
     this.transfer?.finish('interrupted by the port closing')
     this.transfer = null
+    this.assetTransfer?.finish(`Device disconnected during ${this.assetTransfer.kind} transfer.`)
+    this.assetTest?.finish({ ok: false, error: 'Device disconnected.' })
   }
 
   // ── inbound ───────────────────────────────────────────────────────────────────────────────────────
@@ -1361,6 +1391,38 @@ export class CableSession {
         this.report()
         return
       }
+      case 'sound.accept': case 'sound.progress': case 'character.accept': case 'character.progress': {
+        const transfer = this.assetTransfer
+        const [kind, step] = msg.t.split('.')
+        if (!transfer || transfer.kind !== kind || !transfer.bytes.length) return
+        if (step === 'progress' && msg.written !== transfer.offset) {
+          transfer.finish(`The device did not confirm the expected ${kind} bytes.`); return
+        }
+        const slice = transfer.bytes.subarray(transfer.offset, transfer.offset + 4096)
+        transfer.offset += slice.length
+        try {
+          if (!this.link?.isOpen) throw new Error('Device disconnected')
+          await this.link.write(encodeCableFrame(DEVICE_ASSETS[transfer.kind].frame, slice))
+        } catch (error) { transfer.finish(String(error)) }
+        return
+      }
+      case 'sound.tested': case 'character.tested': {
+        const test = this.assetTest
+        if (!test || test.kind !== msg.t.split('.')[0]) return
+        test.finish(msg.ok === true ? { ok: true } : { ok: false, error: str('message') ?? `The device could not test its ${test.kind}.` })
+        return
+      }
+      case 'sound.done': case 'character.done': {
+        const settings = readSettings(msg.settings)
+        if (settings) { this.greetedSettings = settings; this.report() }
+        if (this.assetTransfer?.kind === msg.t.split('.')[0]) this.assetTransfer.finish()
+        return
+      }
+      case 'sound.error': case 'character.error': {
+        const kind = msg.t.split('.')[0]
+        if (this.assetTransfer?.kind === kind) this.assetTransfer.finish(str('message') ?? `The device rejected the ${kind}.`)
+        return
+      }
       case 'fw.accept':
         // The dial has erased its slot and is expecting bytes. Nothing was sent before this.
         // The window is told NOW rather than at the offer: an offer the dial refuses is nothing to
@@ -1428,7 +1490,7 @@ export class CableSession {
   }
 
   private async maybeOfferFirmware(runningVersion: string): Promise<void> {
-    if (!this.host.firmwareFor || this.transfer || !runningVersion) return
+    if (!this.host.firmwareFor || this.transfer || this.assetTransfer || !runningVersion) return
     // The BOARD goes with the version. Which manifest entry this device's image comes from is decided
     // from its own hello, never defaulted — see otaKeyForBoard.
     const candidate = await this.host.firmwareFor(runningVersion, this.greetedHw).catch(() => null)
@@ -1737,6 +1799,64 @@ export class CableSession {
     const sent = await this.send({ t: 'settings.set', ...Object.fromEntries(fields) })
     if (!sent) this.log('cable: settings change not written — the device is not on the wire')
     return sent
+  }
+
+  /** The RPC has already checked this audio's format, length and ownership. One USB slice is in flight. */
+  async setNotificationSound(name: string, bytes: Uint8Array | null): Promise<{ ok: boolean; error?: string }> {
+    return this.installAsset('sound', name, bytes)
+  }
+
+  /**
+   * Install `bytes` as the dial's `kind`, or restore its built-in default with null. The dial verifies the
+   * whole length and SHA-256 before it switches; any failure leaves what it had.
+   */
+  async installAsset(kind: DeviceAssetKind, name: string, bytes: Uint8Array | null): Promise<{ ok: boolean; error?: string }> {
+    const reported = kind === 'sound' ? this.greetedSettings?.soundName : this.greetedSettings?.characterName
+    if (!this.link?.isOpen || !this.greetedSettings || reported === undefined)
+      return { ok: false, error: `This device needs updated firmware for a custom ${kind}.` }
+    if (this.transfer || this.assetTransfer) return { ok: false, error: 'The device is busy.' }
+    const { maxBytes, timeoutMs } = DEVICE_ASSETS[kind]
+    if (bytes && (!bytes.length || bytes.length > maxBytes))
+      return { ok: false, error: kind === 'sound' ? 'Sound is too long.' : 'Character is too large.' }
+    const { createHash } = await import('node:crypto')
+    return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const timer = setTimeout(() => this.assetTransfer?.finish(`The ${kind} transfer timed out.`), timeoutMs)
+      const finish = (error?: string) => {
+        if (this.assetTransfer?.finish !== finish) return
+        clearTimeout(timer)
+        this.assetTransfer = null
+        if (error) void this.send({ t: `${kind}.cancel` })
+        resolve(error ? { ok: false, error } : { ok: true })
+      }
+      this.assetTransfer = { kind, bytes: bytes ?? new Uint8Array(), offset: 0, finish, timer }
+      const request = bytes
+        ? { t: `${kind}.offer`, name, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }
+        : { t: `${kind}.restore` }
+      void this.send(request).then((sent) => { if (!sent) finish('Device disconnected.') })
+    })
+  }
+
+  /**
+   * The app's test button: the dial plays its notification sound, or shows its character's animations, as
+   * installed (or the built-in one). It answers `<kind>.tested`; firmware from before the button answers nothing.
+   */
+  async testAsset(kind: DeviceAssetKind): Promise<{ ok: boolean; error?: string }> {
+    const reported = kind === 'sound' ? this.greetedSettings?.soundName : this.greetedSettings?.characterName
+    if (!this.link?.isOpen || !this.greetedSettings || reported === undefined)
+      return { ok: false, error: `This device needs updated firmware to test its ${kind}.` }
+    if (this.transfer || this.assetTransfer) return { ok: false, error: 'The device is busy.' }
+    if (this.assetTest) return { ok: false, error: 'A test is already running.' }
+    return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const finish = (result: { ok: boolean; error?: string }) => {
+        if (this.assetTest?.finish !== finish) return
+        clearTimeout(this.assetTest.timer)
+        this.assetTest = null
+        resolve(result)
+      }
+      const timer = setTimeout(() => finish({ ok: false, error: `This device needs updated firmware to test its ${kind}.` }), ASSET_TEST_TIMEOUT_MS)
+      this.assetTest = { kind, finish, timer }
+      void this.send({ t: `${kind}.test` }).then((sent) => { if (!sent) finish({ ok: false, error: 'Device disconnected.' }) })
+    })
   }
 
   private async send(msg: Message): Promise<boolean> {

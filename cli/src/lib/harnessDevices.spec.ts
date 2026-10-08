@@ -40,10 +40,70 @@ describe('owner device management', () => {
     expect(await harnessDevicesRequest(service, 'harness_device_settings', { id: 'usb-a', patch: { muted: true } })).toMatchObject({ error: 'DEVICE_WRITE_FAILED' })
   })
   it('encrypts requests, replies and device snapshots over remote relays', () => {
-    for (const type of ['harness_devices_list', 'harness_device_settings']) {
+    for (const type of ['harness_devices_list', 'harness_device_settings', 'harness_device_sound', 'harness_device_character', 'harness_device_test']) {
       expect(encryptDownFrame(type)).toBe(true)
       expect(encryptRpcResult(`${type}_result`)).toBe(true)
     }
     expect(ENCRYPTED_UP_TYPES.has('harness_devices_changed')).toBe(true)
+  })
+  it('installs a character only on firmware that reports one, within its slot', async () => {
+    const { service } = fixture()
+    const character = vi.fn(async () => ({ ok: true }))
+    service.character = character
+    service.status = () => ({ attached: true, devices: [
+      { id: 'new', attached: true, settings: { ...settings, soundName: '', soundBytes: 0, characterName: '', characterBytes: 0 } },
+      { id: 'sound-only', attached: true, settings: { ...settings, soundName: '', soundBytes: 0 } },
+    ] })
+    const data = Buffer.from([1, 2, 3]).toString('base64')
+    expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'sound-only', name: 'Knight', data })).toMatchObject({ error: 'UNSUPPORTED' })
+    expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'gone', name: 'Knight', data })).toMatchObject({ error: 'DEVICE_OFFLINE' })
+    for (const invalid of ['', 'a', Buffer.alloc(0x80000 - 79).toString('base64')])
+      expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'new', name: 'Knight', data: invalid })).toMatchObject({ error: 'BAD_DEVICE_CHARACTER' })
+    expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'new', name: '\u00e9', data })).toMatchObject({ error: 'BAD_DEVICE_CHARACTER' })
+    const largest = Buffer.alloc(0x80000 - 80, 9)
+    expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'new', name: 'Knight', data: largest.toString('base64') })).toMatchObject({ ok: true })
+    expect(character).toHaveBeenLastCalledWith('new', 'Knight', largest)
+    expect(await harnessDevicesRequest(service, 'harness_device_character', { id: 'new', name: '', data: null })).toMatchObject({ ok: true })
+    expect(character).toHaveBeenLastCalledWith('new', '', null)
+  })
+
+  it('accepts only bounded sound data for a capable, addressed device', async () => {
+    const { service } = fixture()
+    const sound = vi.fn(async () => ({ ok: true }))
+    service.sound = sound
+    service.status = () => ({ attached: true, devices: [
+      { id: 'usb-a', attached: true, settings: { ...settings, soundName: '', soundBytes: 0 } },
+      { id: 'usb-b', attached: true, settings },
+      { id: 'updating', attached: true, updating: 'next', settings: { ...settings, soundName: '' } },
+    ] })
+    const data = Buffer.from([0, 127, 255]).toString('base64')
+    expect(await harnessDevicesRequest(service, 'harness_device_sound', { id: 'usb-b', name: 'Bell', data })).toMatchObject({ error: 'UNSUPPORTED' })
+    expect(await harnessDevicesRequest(service, 'harness_device_sound', { id: 'updating', name: 'Bell', data })).toMatchObject({ error: 'DEVICE_UPDATING' })
+    for (const invalid of ['', '@@@=', Buffer.alloc(0x40000 - 79).toString('base64')])
+      expect(await harnessDevicesRequest(service, 'harness_device_sound', { id: 'usb-a', name: 'Bell', data: invalid })).toMatchObject({ error: 'BAD_DEVICE_SOUND' })
+    expect(await harnessDevicesRequest(service, 'harness_device_sound', { id: 'usb-a', name: 'Bell', data })).toMatchObject({ ok: true })
+    expect(sound).toHaveBeenCalledWith('usb-a', 'Bell', Buffer.from([0, 127, 255]))
+    expect(await harnessDevicesRequest(service, 'harness_device_sound', { id: 'usb-a', name: '', data: null })).toMatchObject({ ok: true })
+    expect(sound).toHaveBeenLastCalledWith('usb-a', '', null)
+  })
+
+  it('tests only an addressed device that reports the asset, passing its refusal as a message', async () => {
+    const { service } = fixture()
+    const test = vi.fn(async (_id: string, kind: string) => kind === 'sound' ? { ok: true } : { ok: false, error: 'The device is muted.' })
+    service.test = test
+    service.status = () => ({ attached: true, devices: [
+      { id: 'new', attached: true, settings: { ...settings, soundName: '', soundBytes: 0, characterName: '', characterBytes: 0 } },
+      { id: 'old', attached: true, settings },
+      { id: 'updating', attached: true, updating: 'next', settings: { ...settings, soundName: '' } },
+    ] })
+    expect(await harnessDevicesRequest(service, 'harness_device_test', { id: 'new', kind: 'sound' })).toEqual({ ok: true })
+    expect(test).toHaveBeenLastCalledWith('new', 'sound')
+    expect(await harnessDevicesRequest(service, 'harness_device_test', { id: 'new', kind: 'character' })).toEqual({ ok: false, message: 'The device is muted.' })
+    expect(await harnessDevicesRequest(service, 'harness_device_test', { id: 'old', kind: 'sound' })).toMatchObject({ error: 'UNSUPPORTED' })
+    expect(await harnessDevicesRequest(service, 'harness_device_test', { id: 'gone', kind: 'sound' })).toMatchObject({ error: 'DEVICE_OFFLINE' })
+    expect(await harnessDevicesRequest(service, 'harness_device_test', { id: 'updating', kind: 'sound' })).toMatchObject({ error: 'DEVICE_UPDATING' })
+    for (const bad of [{ id: 'new', kind: 'firmware' }, { id: '', kind: 'sound' }, { kind: 'sound' }])
+      expect(await harnessDevicesRequest(service, 'harness_device_test', bad)).toMatchObject({ error: 'BAD_DEVICE_TEST' })
+    expect(test).toHaveBeenCalledTimes(2)
   })
 })

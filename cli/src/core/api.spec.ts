@@ -274,6 +274,8 @@ describe('the core API services stand on', () => {
     }
     // A grid command may run half an hour, and is waited for longer than that.
     expect(LONG_ANSWERS.models!.grid_fleet_run).toBeGreaterThan(30 * 60_000)
+    expect(LONG_ANSWERS.devices!.harness_device_sound).toBeGreaterThan(60_000)
+    expect(LONG_ANSWERS.devices!.harness_device_character).toBeGreaterThan(120_000)
   })
 
   it('gives a service that acts on no agent nothing to create and no harness to read, and a daemon it was never told of', async () => {
