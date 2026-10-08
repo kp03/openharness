@@ -31,7 +31,7 @@ function tempRoot(): string {
   return root
 }
 
-function seedSession(root: string, opts: { expiresInMs?: number } = {}): void {
+function seedSession(root: string, opts: { expiresInMs?: number; overrides?: Record<string, unknown> } = {}): void {
   const authDir = join(root, 'auth')
   mkdirSync(authDir, { recursive: true })
   writeFileSync(join(authDir, 'session.json'), JSON.stringify({
@@ -43,6 +43,7 @@ function seedSession(root: string, opts: { expiresInMs?: number } = {}): void {
     computerId: 'a'.repeat(32),
     machineId: 'm_seeded',
     updatedAt: Date.now(),
+    ...opts.overrides,
   }))
 }
 
@@ -97,6 +98,9 @@ function runAsync(root: string, args: string[], backendUrl?: string): Promise<{ 
  *  `auth status` make — real network shape, canned answers, so the CLI's own code runs unmodified.
  *  `routes` stubs any other path (the QR sign-in's `/api/auth/qr/*`). A handler may answer with a
  *  promise, so a test can hold a step open. `calls` records every request in arrival order. */
+/** A route's refusal, answered as the backend's own error envelope with [status]. */
+class Refusal { constructor(readonly status: number, readonly code: string, readonly message: string) {} }
+
 function fakeBackend(handlers: {
   authorizeNative?: (body: any) => any
   exchange?: (body: any) => any
@@ -112,6 +116,11 @@ function fakeBackend(handlers: {
         const body = raw ? JSON.parse(raw) : {}
         calls.push({ url: req.url ?? '', body })
         const send = (data: unknown): void => {
+          if (data instanceof Refusal) {
+            res.writeHead(data.status, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ success: false, error: { code: data.code, message: data.message } }))
+            return
+          }
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ success: true, data }))
         }
@@ -230,6 +239,19 @@ describe('harness auth status --json', () => {
     const result = runSync(root, ['auth', 'status'])
     expect(result.status).toBe(0)
     expect(result.stdout).toContain('Not signed in')
+  })
+
+  it('tells a computer signed in by QR that billing still needs a Google or Apple sign-in, and grid does not', () => {
+    // A Harness-issued sign-in now goes to grid like any other (autonomous-grid ADR 0046), so naming
+    // grid here would send the person to sign in again for nothing. Billing's Autonomous service
+    // still cannot take one.
+    const root = tempRoot()
+    seedSession(root, { overrides: { accessToken: `hna_${'Q'.repeat(43)}`, method: 'qr' } })
+    const result = runSync(root, ['auth', 'status'], 'http://127.0.0.1:1')
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('by your phone')
+    expect(result.stdout).toContain('Billing needs a Google or Apple sign-in: harness login --force')
+    expect(result.stdout).not.toMatch(/grid/i)
   })
 
   it('reports loggedIn:true from a saved, non-expiring session without a network round trip', () => {
@@ -455,6 +477,7 @@ describe('harness login --json', () => {
         '/api/auth/qr/poll': () => ({ status: 'approved', email: 'dee@example.com' }),
         '/api/auth/qr/claim': () => ({ token: 'tok_qr', refreshToken: 'r', expiresIn: 3600, email: 'dee@example.com' }),
         '/api/auth/qr/cancel': () => ({ cancelled: true }),
+        '/api/auth/me': () => ({ user: { id: 'acct_qr' } }),
       },
       // Held open so the app's pipe has closed well before the sign-in is done.
       resolveComputer: () => later(500, { machine: { machineId: 'm_qr' } }),
@@ -467,7 +490,8 @@ describe('harness login --json', () => {
     expect(await login.exit).toBe(0)
     const session = JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8')) as Record<string, unknown>
     // A sign-in by hand: a sign-in epoch of its own, which the device key log keeps its marks by.
-    expect(session).toMatchObject({ accessToken: 'tok_qr', method: 'qr', signInEpoch: expect.stringMatching(/^[0-9a-f]{32}@\d+$/) })
+    // And the account it was made to, which lets the device key log start over for it at any time.
+    expect(session).toMatchObject({ accessToken: 'tok_qr', method: 'qr', signInEpoch: expect.stringMatching(/^[0-9a-f]{32}@\d+$/), signInAcct: 'acct_qr' })
     expect(calls.map((c) => c.url)).not.toContain('/api/auth/qr/cancel')
   }, 30_000)
 
@@ -490,11 +514,15 @@ describe('harness login --json', () => {
     const root = tempRoot()
     seedSession(root)
     const gridCalls = recordingGrid(root)
-    const { base } = await fakeBackend({
+    const { base, calls } = await fakeBackend({
       resolveComputer: () => ({ machine: { machineId: 'm_seeded' } }),
+      routes: { '/api/auth/me': () => ({ user: { id: 'acct_other' } }) },
     })
     const result = await runAsync(root, ['login', '--json'], base)
     expect(result.status).toBe(0)
+    // Not a sign-in by hand: the account it was made to is not asked again, nor written.
+    expect(calls.map((c) => c.url)).not.toContain('/api/auth/me')
+    expect(JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8'))).not.toHaveProperty('signInAcct')
     const lines = result.stdout.trim().split('\n').map((l) => JSON.parse(l))
     // Harness only: grid is an add-on, signed in the first time a grid feature is used — so the line
     // says nothing about grid, and not one `grid` command ran, though a `grid` was right there.
@@ -554,6 +582,8 @@ describe('harness login --json', () => {
       await login.exit
       const session = JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8')) as Record<string, unknown>
       expect(session.clientId).toBe(kept)
+      // `/api/auth/me` is not answered here: the sign-in goes on, with no account recorded.
+      expect(session).not.toHaveProperty('signInAcct')
     }
   }, 45_000)
 
@@ -564,6 +594,7 @@ describe('harness login --json', () => {
       authorizeNative: (body) => { capturedRedirectUri = body.redirectUri; return { authorizeUrl: 'https://sso.example.test/authorize?tx=abc', tx: 'tx_abc' } },
       exchange: () => ({ token: 'tok_new', refreshToken: 'refresh_new', expiresIn: 3600, autonomousEnv: 'prod' }),
       resolveComputer: () => ({ machine: { machineId: 'm_new' } }),
+      routes: { '/api/auth/me': () => ({ user: { id: 'acct_new' } }) },
     })
 
     const gridCalls = recordingGrid(root)
@@ -600,6 +631,7 @@ describe('harness login --json', () => {
     expect(lines[1]).toEqual({ type: 'result', status: 'success', fingerprint: expect.stringMatching(FP) })
     expect(lines[1].fingerprint).toBe(fingerprintOnDisk(root))
     expect(existsSync(gridCalls)).toBe(false)
+    expect(JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8'))).toMatchObject({ machineId: 'm_new', signInAcct: 'acct_new' })
   }, 15_000)
 
   it('already signed in with no key yet: makes the key and reports its fingerprint', async () => {
@@ -635,4 +667,55 @@ describe('harness login (human)', () => {
     expect(result.status).toBe(0)
     expect(result.stdout).toContain(`  ✓ Already signed in — this machine is "${hostname().slice(0, 60)}" · ${fp}\n    Run \`harness start\` to connect this computer.`)
   })
+})
+
+describe('harness login --ticket', () => {
+  const claimed = () => ({ token: 'tok_box', refreshToken: 'r', expiresIn: 3600, email: 'dee@example.com' })
+
+  it('spends the ticket and signs the box in, with nothing to scan or confirm', async () => {
+    const root = tempRoot()
+    const { base, calls } = await fakeBackend({
+      routes: { '/api/auth/qr/claim': claimed, '/api/auth/me': () => ({ user: { id: 'acct_box' } }) },
+      resolveComputer: () => ({ machine: { machineId: 'm_box' } }),
+    })
+    const result = await runAsync(root, ['login', '--ticket=hnp_ticket', '--json'], base)
+    expect(result.status).toBe(0)
+    expect(JSON.parse(result.stdout.trim())).toEqual({ type: 'result', status: 'success', email: 'dee@example.com', fingerprint: expect.stringMatching(FP) })
+    expect(calls).toContainEqual({ url: '/api/auth/qr/claim', body: { pollToken: 'hnp_ticket' } })
+    expect(calls.map((c) => c.url)).not.toContain('/api/auth/qr/start')
+    expect(JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8'))).toMatchObject({ accessToken: 'tok_box', method: 'qr', machineId: 'm_box', signInAcct: 'acct_box' })
+  }, 30_000)
+
+  it('refuses on a computer that is already signed in, even with --force, and leaves the ticket unspent', async () => {
+    const root = tempRoot()
+    seedSession(root)
+    const { base, calls } = await fakeBackend({ routes: { '/api/auth/qr/claim': claimed } })
+    const result = await runAsync(root, ['login', '--force', '--ticket=hnp_ticket', '--json'], base)
+    expect(result.status).toBe(1)
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({ type: 'result', status: 'error', code: 'ALREADY_SIGNED_IN' })
+    expect(calls).toEqual([])
+  }, 30_000)
+
+  it('a spent ticket stays a sign-in when the machine lookup fails, so the daemon still moves onto the account', async () => {
+    const root = tempRoot()
+    const { base } = await fakeBackend({
+      routes: { '/api/auth/qr/claim': claimed },
+      resolveComputer: () => new Refusal(503, 'UNAVAILABLE', 'try later'),
+    })
+    const result = await runAsync(root, ['login', '--ticket=hnp_ticket', '--json'], base)
+    expect(result.status).toBe(0)
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({ type: 'result', status: 'success', email: 'dee@example.com' })
+    const saved = JSON.parse(readFileSync(join(root, 'auth', 'session.json'), 'utf8')) as Record<string, unknown>
+    expect(saved).toMatchObject({ accessToken: 'tok_box', method: 'qr' })
+    expect(saved).not.toHaveProperty('machineId')
+  }, 30_000)
+
+  it('says TICKET_INVALID for a ticket the backend refuses, and writes no session', async () => {
+    const root = tempRoot()
+    const { base } = await fakeBackend({ routes: { '/api/auth/qr/claim': () => new Refusal(401, 'QR_INVALID', 'Nothing to claim: scan again.') } })
+    const result = await runAsync(root, ['login', '--ticket=hnp_spent', '--json'], base)
+    expect(result.status).toBe(1)
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({ type: 'result', status: 'error', code: 'TICKET_INVALID' })
+    expect(existsSync(join(root, 'auth', 'session.json'))).toBe(false)
+  }, 30_000)
 })

@@ -7,14 +7,15 @@
 //!   remove), the links made from here (unlink), and the steps that add another machine.
 //! - **Add phone…** — the QR code the app shows (the very same link), in half blocks.
 //!
-//! Everything that writes asks y/n in the panel's footer first. The CLI and the daemon's REST go
-//! through one [Req] → [Reply] runner, which tests replace with fake answers: nothing here reaches a
-//! real daemon or CLI from a test.
+//! Everything that writes asks y/n first, in a dialog over the panel (`dialog::Dialog`, the one
+//! every question uses); a typed line is asked there too, never in the search line. The CLI and
+//! the daemon's REST go through one [Req] → [Reply] runner, which tests replace with fake answers:
+//! nothing here reaches a real daemon or CLI from a test.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +24,8 @@ use serde_json::{json, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
+use crate::buttons::{self, Answer, Button};
+use crate::dialog::{self, Dialog, Input, INPUT_W};
 use crate::fleet::{Reach, State};
 use crate::modal::{Modal, PickerKind};
 use crate::picker::{Picker, Row};
@@ -138,12 +141,17 @@ pub enum Act {
     ArmPhone,
 }
 
-/// The panel is asking: a line to type (a password shown as dots), or a y/n before a write.
+/// The panel is asking, in a dialog over it: a line to type (a password shown as dots; the caret
+/// [caret] characters in), or a y/n before a write.
 #[derive(Clone, Debug)]
 pub enum Ask {
-    Entry { what: Entry, label: String, value: String, secret: bool },
+    Entry { what: Entry, label: String, value: String, caret: usize, secret: bool },
     Confirm { question: String, act: Act },
 }
+
+/// Where the dialog drew its buttons and its input, for clicks on this screen size.
+#[derive(Clone, Copy)]
+struct PromptActions { size: (u16, u16), accept: Rect, cancel: Rect, input: Option<Rect> }
 
 pub struct Devices {
     /// `remote-password status --json` ({hasPassword, fingerprint, setAt}), or why it is unknown.
@@ -154,6 +162,13 @@ pub struct Devices {
     pub link: Option<Linking>,
     pub phone: Phone,
     pub ask: Option<Ask>,
+    prompt_actions: std::cell::Cell<Option<PromptActions>>,
+    /// The chosen button of the prompt's row (0 Cancel, 1 the action), and whether the keys are on
+    /// the buttons: a confirmation's always are, a typed line's only after Tab.
+    prompt_row: std::cell::Cell<usize>,
+    prompt_focus: std::cell::Cell<bool>,
+    /// Set by a draw that had no room for the question: [cancel_unfit] ends it after the frame.
+    unfit: std::cell::Cell<bool>,
     /// A level inside a view: a machine's actions (`m:<id>`).
     pub sub: Option<String>,
     /// The footer's line: what happened, or (true) what went wrong — until the next thing does.
@@ -166,7 +181,7 @@ pub struct Devices {
 impl Default for Devices {
     fn default() -> Devices {
         Devices {
-            password: None, links: None, account: HashMap::new(), link: None, phone: Phone::default(), ask: None, sub: None, footer: None, loading: Vec::new(), runner: default_runner(),
+            password: None, links: None, account: HashMap::new(), link: None, phone: Phone::default(), ask: None, prompt_actions: Default::default(), prompt_row: Default::default(), prompt_focus: Default::default(), unfit: Default::default(), sub: None, footer: None, loading: Vec::new(), runner: default_runner(),
         }
     }
 }
@@ -223,8 +238,10 @@ pub fn ask(app: &mut App, req: Req, line: Option<fn(&mut App, &str)>, then: impl
         if let (Some(line), Reply::Cli { out, .. }) = (line, &reply) { for l in out.lines() { line(app, l) } }
         return then(app, reply);
     }
+    let epoch = app.account_epoch;
+    let then = move |app: &mut App, reply| { if app.account_epoch == epoch { then(app, reply); } };
     match req {
-        Req::Cli { args, stdin } => { let sink = app.sink.clone(); app.spawn(run_cli(args, stdin, line, sink), then) }
+        Req::Cli { args, stdin } => { let sink = app.sink.clone(); app.spawn(run_cli(args, stdin, line, sink, epoch), then) }
         Req::Http { method, path, body } => {
             let port = app.port;
             // (A phone's handshake holds `/api/pair` open while it runs; the app waits 60 s for it.)
@@ -239,7 +256,7 @@ pub fn ask(app: &mut App, req: Req, line: Option<fn(&mut App, &str)>, then: impl
 /// The CLI that started us (node + its script), else `harness` on PATH — as M-l always ran it: its
 /// stdin one line then closed, its stdout read line by line (each to [line] as it comes), its
 /// stderr drained so a full pipe never stalls it.
-async fn run_cli(args: Vec<String>, stdin: Option<String>, line: Option<fn(&mut App, &str)>, sink: tokio::sync::mpsc::UnboundedSender<crate::event::Event>) -> Reply {
+async fn run_cli(args: Vec<String>, stdin: Option<String>, line: Option<fn(&mut App, &str)>, sink: tokio::sync::mpsc::UnboundedSender<crate::event::Event>, epoch: u64) -> Reply {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use std::process::Stdio;
     let exe = std::env::var("HARNESS_CLI").unwrap_or_else(|_| "harness".into());
@@ -256,7 +273,7 @@ async fn run_cli(args: Vec<String>, stdin: Option<String>, line: Option<fn(&mut 
         let mut lines = tokio::io::BufReader::new(pipe).lines();
         let read = async {
             while let Ok(Some(l)) = lines.next_line().await {
-                if let Some(f) = line { let each = l.clone(); let _ = sink.send(crate::event::Event::Apply(Box::new(move |app: &mut App| f(app, &each)))); }
+                if let Some(f) = line { let each = l.clone(); let _ = sink.send(crate::event::Event::Apply(Box::new(move |app: &mut App| { if app.account_epoch == epoch { f(app, &each); } }))); }
                 out.push_str(&l);
                 out.push('\n');
             }
@@ -453,6 +470,7 @@ fn enter(app: &mut App, view: View) {
 
 /// What a view needs read when it opens.
 fn opened(app: &mut App, view: View) {
+    crate::account::refresh(app, false);
     match view {
         View::Connect => { load_me(app); load_account(app) }
         View::Machines => { load_password(app); load_links(app); load_account(app); load_me(app) }
@@ -709,7 +727,7 @@ fn run_act(app: &mut App, act: Act) {
             ask(app, http("DELETE", path, None), None, move |app, reply| {
                 match reply {
                     Reply::Http(Ok(_)) => {
-                        app.fleet.machines.retain(|m| m.id != machine);
+                        app.account_machine_removed(&machine);
                         app.devices.account.remove(&machine);
                         if app.devices.sub.as_deref() == Some(&format!("m:{machine}")) { app.devices.sub = None }
                         note(app, format!("Deleted {name} from your account"));
@@ -788,10 +806,63 @@ fn link_line(app: &mut App, line: &str) {
 // ── asking ───────────────────────────────────────────────────────────────────
 
 fn entry(app: &mut App, what: Entry, label: impl Into<String>, value: &str, secret: bool) {
-    app.devices.ask = Some(Ask::Entry { what, label: label.into(), value: value.to_string(), secret });
+    app.devices.prompt_actions.set(None);
+    app.devices.prompt_row.set(1);
+    app.devices.prompt_focus.set(false);
+    app.devices.ask = Some(Ask::Entry { what, label: label.into(), value: value.to_string(), caret: value.chars().count(), secret });
 }
 
-fn confirm(app: &mut App, question: impl Into<String>, act: Act) { app.devices.ask = Some(Ask::Confirm { question: question.into(), act }) }
+/// The byte where the [caret]th character of [value] starts.
+fn at_char(value: &str, caret: usize) -> usize { value.char_indices().nth(caret).map_or(value.len(), |(i, _)| i) }
+
+fn confirm(app: &mut App, question: impl Into<String>, act: Act) {
+    app.devices.prompt_actions.set(None);
+    // A destructive yes starts on Cancel, a safe one on Yes.
+    let risky = matches!(act, Act::ClearPassword | Act::Unlink { .. } | Act::Remove { .. } | Act::Unpair { .. });
+    app.devices.prompt_row.set(usize::from(!risky));
+    app.devices.prompt_focus.set(true);
+    app.devices.ask = Some(Ask::Confirm { question: question.into(), act });
+}
+
+/// Passwords and names belong to the active prompt, never to the search beneath it.
+/// A paste cannot answer a confirmation, even if it contains "y" or a newline.
+pub fn paste(app: &mut App, text: &str) -> bool {
+    if view_of(app).is_none() || app.devices.ask.is_none() { return false }
+    if let Some(Ask::Entry { value, caret, .. }) = &mut app.devices.ask {
+        let pasted: String = text.chars().filter(|c| !c.is_control()).collect();
+        value.insert_str(at_char(value, *caret), &pasted);
+        *caret += pasted.chars().count();
+    }
+    true
+}
+
+/// While a prompt is open, clicks on the underlying list cannot become Enter.
+/// Only the actions drawn for this prompt can advance it; a click on its input gives the input
+/// the keys; a click outside the panel cancels.
+pub fn mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if view_of(app).is_none() || app.devices.ask.is_none() { return false }
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || !mouse.modifiers.is_empty() { return true }
+    let at = Position::new(mouse.column, mouse.row);
+    let action = app.devices.prompt_actions.get().filter(|a| a.size == app.size);
+    if action.and_then(|a| a.input).is_some_and(|r| r.contains(at)) {
+        app.devices.prompt_focus.set(false);
+        return true;
+    }
+    let key = if action.is_some_and(|a| a.accept.contains(at)) {
+        app.devices.prompt_focus.set(false);   // a click on Continue is Enter on the line, not on a chosen Cancel
+        Some(if matches!(app.devices.ask, Some(Ask::Confirm { .. })) { KeyCode::Char('y') } else { KeyCode::Enter })
+    } else if action.is_some_and(|a| a.cancel.contains(at)) {
+        Some(KeyCode::Esc)
+    } else if matches!(&app.modal, Some(Modal::Picker { picker, .. }) if !picker.screen_area.get().contains(at)) {
+        Some(KeyCode::Esc)
+    } else { None };
+    if let Some(key) = key {
+        crate::workspace_controls::begin_press(app, MouseButton::Left);
+        answer_key(app, KeyEvent::new(key, KeyModifiers::NONE));
+        again(app);
+    }
+    true
+}
 
 fn start_link(app: &mut App, machine: String, name: String) {
     let label = format!("Remote password for {name}");
@@ -825,26 +896,67 @@ fn submit(app: &mut App, what: Entry, value: String) {
 
 /// A key while the panel asks: a y/n answered, or a line typed (Enter goes on, Esc lets it go).
 fn answer_key(app: &mut App, key: KeyEvent) {
+    app.devices.prompt_actions.set(None);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match app.devices.ask.take() {
-        Some(Ask::Confirm { question, act }) => match key.code {
-            KeyCode::Char('y' | 'Y') if !ctrl => run_act(app, act),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => note(app, "Nothing changed"),
-            KeyCode::Char('c' | 'g') if ctrl => note(app, "Nothing changed"),
-            _ => app.devices.ask = Some(Ask::Confirm { question, act }),
-        },
-        Some(Ask::Entry { what, label, mut value, secret }) => {
+        Some(Ask::Confirm { question, act }) => {
+            let mut row = prompt_row(app, true, "Yes");
+            let answer = match key.code {
+                KeyCode::Char('Y') if !ctrl => Answer::Chosen(1),
+                KeyCode::Char('N') if !ctrl => Answer::Chosen(0),
+                code => row.key(code, key.modifiers),
+            };
+            match answer {
+                Answer::Chosen(1) => run_act(app, act),
+                Answer::Chosen(_) | Answer::Cancel => note(app, "Nothing changed"),
+                Answer::Moved => {
+                    app.devices.prompt_row.set(row.chosen);
+                    app.devices.ask = Some(Ask::Confirm { question, act });
+                }
+                Answer::Ignored => app.devices.ask = Some(Ask::Confirm { question, act }),
+            }
+        }
+        Some(Ask::Entry { what, label, mut value, mut caret, secret }) => {
+            // (↓ from the input to the buttons, ↑ back up, as Tab goes either way.)
+            let on_buttons = app.devices.prompt_focus.get();
+            let across = match key.code { KeyCode::Tab | KeyCode::BackTab => true, KeyCode::Down => !on_buttons, KeyCode::Up => on_buttons, _ => false };
+            if across {
+                app.devices.prompt_focus.set(!on_buttons);
+                app.devices.ask = Some(Ask::Entry { what, label, value, caret, secret });
+                return;
+            }
+            // A printable key is typed, wherever the keys were: the input has them again.
+            if matches!(key.code, KeyCode::Char(_)) && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) { app.devices.prompt_focus.set(false) }
+            if app.devices.prompt_focus.get() {
+                let mut row = prompt_row(app, false, "Continue");
+                match row.key(key.code, key.modifiers) {
+                    Answer::Chosen(1) => { app.devices.footer = None; return submit(app, what, value) }
+                    Answer::Chosen(_) | Answer::Cancel => return note(app, "Nothing changed"),
+                    Answer::Moved => app.devices.prompt_row.set(row.chosen),
+                    Answer::Ignored => {}
+                }
+                app.devices.ask = Some(Ask::Entry { what, label, value, caret, secret });
+                return;
+            }
+            // The input has the keys: they edit at the caret, which ← → Home End move.
+            let len = value.chars().count();
+            caret = caret.min(len);
             match key.code {
                 KeyCode::Enter => { app.devices.footer = None; return submit(app, what, value) }
                 KeyCode::Esc => return note(app, "Nothing changed"),
                 KeyCode::Char('c' | 'g') if ctrl => return note(app, "Nothing changed"),
-                KeyCode::Char('u') if ctrl => value.clear(),
-                KeyCode::Char('h') if ctrl => { value.pop(); }
-                KeyCode::Backspace => { value.pop(); }
-                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => value.push(c),
+                KeyCode::Char('u') if ctrl => { value.clear(); caret = 0 }
+                KeyCode::Char('h') if ctrl && caret > 0 => { caret -= 1; value.remove(at_char(&value, caret)); }
+                KeyCode::Backspace if caret > 0 => { caret -= 1; value.remove(at_char(&value, caret)); }
+                KeyCode::Delete if caret < len => { value.remove(at_char(&value, caret)); }
+                KeyCode::Left => caret = caret.saturating_sub(1),
+                KeyCode::Right => caret = (caret + 1).min(len),
+                KeyCode::Home => caret = 0,
+                KeyCode::End => caret = len,
+                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => { value.insert(at_char(&value, caret), c); caret += 1 }
                 _ => {}
             }
-            app.devices.ask = Some(Ask::Entry { what, label, value, secret });
+            app.devices.ask = Some(Ask::Entry { what, label, value, caret, secret });
         }
         None => {}
     }
@@ -914,6 +1026,7 @@ pub fn choose(app: &mut App, view: View, picker: Picker, enter: bool) {
             return;
         }
         (View::Connect, "here") if rest == "setup" => switch(app, View::Machines),
+        (_, "account") => { crate::account::open(app); return }
         (View::Connect, "m") => { let name = name_of(app, &rest); start_link(app, rest, name) }
         (_, "m") => sub(app, format!("m:{rest}")),
         (_, "act") => machine_action(app, &rest),
@@ -980,15 +1093,26 @@ fn machine_action(app: &mut App, rest: &str) {
         "connect" => { switch(app, View::Connect); if let Some(p) = picker_mut(app) { p.select(&format!("m:{machine}")) } start_link(app, machine, name) }
         "open" => {
             app.devices.sub = None;
-            let kind = PickerKind::Open { filter: crate::modal::Filter::All, machine: Some(machine), project: None };
-            let (title, placeholder) = crate::modal::launcher_title(app, &kind);
-            let mut next = Picker::new(title, placeholder);
-            next.prefixed = true;
-            crate::input::fill(app, &kind, &mut next);
-            app.modal = Some(Modal::Picker { kind, picker: next });
+            open_machine_list(app, &machine);
         }
         _ => {}
     }
+}
+
+/// Machines & devices on [machine]: its own actions (rename, connect, remove…).
+pub(crate) fn open_machine(app: &mut App, machine: &str) {
+    open(app, View::Machines);
+    sub(app, format!("m:{machine}"));
+}
+
+/// [machine]'s harnesses: the Open list on it ("Open its harnesses").
+pub(crate) fn open_machine_list(app: &mut App, machine: &str) {
+    let kind = PickerKind::Open { filter: crate::modal::Filter::All, machine: Some(machine.to_string()), project: None };
+    let (title, placeholder) = crate::modal::launcher_title(app, &kind);
+    let mut next = Picker::new(title, placeholder);
+    next.prefixed = true;
+    crate::input::fill(app, &kind, &mut next);
+    app.modal = Some(Modal::Picker { kind, picker: next });
 }
 
 // ── rows ─────────────────────────────────────────────────────────────────────
@@ -1039,12 +1163,11 @@ pub fn fill(app: &App, view: View, picker: &mut Picker) {
 
 fn connect_rows(app: &App) -> Vec<Row> {
     let setup = || Row::new("here:setup", "Set up another computer").group("Get connected").lead(dot("→", theme::TEAL));
-    if app.devices.phone.signed_out && !app.daemon_down {
-        return vec![Row::new("here:login", "Sign in on this computer").group("Get connected")
-            .lead(dot("→", theme::TEAL)).detail(vec![span("Use the same Harness account on both computers.", fg(theme::MUTED))]), setup()];
+    if app.account.status == crate::account::Status::SignedOut || app.devices.phone.signed_out {
+        return vec![account_row(app), info("local-use", "Local harnesses work without an account.", "This computer"), setup()];
     }
     let (mut ready, mut done, mut away) = (Vec::new(), Vec::new(), Vec::new());
-    for m in app.fleet.machines.iter().filter(|m| !m.local) {
+    for m in app.fleet.machines.iter().filter(|m| !m.local && !m.shared) {
         let (glyph, color, word) = reach(app, m);
         let linking = app.devices.link.as_ref().is_some_and(|l| l.machine == m.id && l.result.is_none());
         // (One just linked stays in view, how it went beside it.)
@@ -1065,8 +1188,13 @@ fn connect_rows(app: &App) -> Vec<Row> {
     ready
 }
 
+fn account_row(app: &App) -> Row {
+    let detail = if app.account.status == crate::account::Status::SignedOut { "Connect computers, sync your workspace and use your phone" } else { "Your Harness account and connected computers" };
+    Row::new("account", crate::account::label(app)).group("Account").detail(vec![span(detail, fg(theme::MUTED))])
+}
+
 fn machines_rows(app: &App) -> Vec<Row> {
-    let mut rows = Vec::new();
+    let mut rows = vec![account_row(app)];
     let here = "This computer";
     let password = app.devices.password.as_ref();
     let set = password.and_then(|p| p.as_ref().ok()).and_then(|v| v.get("hasPassword")).and_then(Value::as_bool);
@@ -1083,7 +1211,7 @@ fn machines_rows(app: &App) -> Vec<Row> {
     if matches!(password, Some(Err(_))) { rows.push(Row::new("pw:status", "Retry").group(here).extra("password status").lead(dot("↻", theme::MUTED)).detail(vec![span("Password status is unavailable.", fg(theme::WARN))])) }
 
     let yours = "Your machines";
-    for m in &app.fleet.machines {
+    for m in app.fleet.machines.iter().filter(|m| !m.shared) {
         if crate::local::is_local(&m.id) { continue }
         let (glyph, color, word) = reach(app, m);
         let rtt = app.rtt.get(&m.id).filter(|_| m.usable()).map(|d| format!("{}ms  ", d.as_millis())).unwrap_or_default();
@@ -1175,6 +1303,7 @@ pub fn preview(app: &App, view: View, id: &str) -> Vec<Line<'static>> {
         "here" => vec![Line::raw("Set up Harness on your other computer."), Line::raw(""),
             dim("The setup guide covers sign-in, the remote password and servers.").into(),
             Line::raw(""), dim("Enter opens Machines & devices.").into()],
+        "account" => vec![Line::raw("Use Harness locally without signing in."), Line::raw(""), Line::raw("Sign in to connect your computers, sync your workspace, and use your phone."), Line::raw("Run models on one linked computer and use them from another.")],
         "m" => {
             let mut out = machine_lines(app, rest);
             if view == View::Connect {
@@ -1311,21 +1440,95 @@ fn head(buf: &mut Buffer, app: &App, title: &str, x: u16, y: u16, right: u16, c:
     settings::put(buf, right.saturating_sub(3), y, 3, "esc", c.muted);
 }
 
-/// The query line — or, while the panel asks for a line, that line (a password as dots).
+/// The query line: always the search (what the panel asks is asked in its dialog).
 fn query_line(buf: &mut Buffer, app: &App, picker: &Picker, x: u16, y: u16, right: u16, c: &Chrome) -> Option<Position> {
     let w = right.saturating_sub(x);
-    if let Some(Ask::Entry { label, value, secret, .. }) = &app.devices.ask {
-        let at = x + settings::put(buf, x, y, w, &format!("{label} › "), c.accent);
-        let shown = if *secret { "•".repeat(value.chars().count()) } else { value.clone() };
-        settings::put(buf, at, y, right.saturating_sub(at), &shown, c.base);
-        return Some(Position::new((at + shown.width() as u16).min(right), y));
-    }
     settings::put(buf, x, y, 2, "›", c.accent);
     let shown = if picker.query.is_empty() { (picker.placeholder.as_str(), c.muted) } else { (picker.query.as_str(), c.base) };
     settings::put(buf, x + 2, y, w.saturating_sub(2), shown.0, shown.1);
     picker.prompt_at.set((y, x + 2));
     let before: String = picker.query.chars().take(picker.qcursor).collect();
     (app.devices.ask.is_none()).then(|| Position::new((x + 2 + before.width() as u16).min(right), y))
+}
+
+/// What is being asked, as the shared dialog centred over [over] (the panel, or Add phone's words
+/// beside its QR code): its title, the question — or the input under its label, with what to do
+/// or what went wrong under it — and the buttons. Its buttons and input are kept for clicks;
+/// returns where the terminal cursor goes. Nothing is drawn where its buttons cannot fit.
+fn ask_dialog(buf: &mut Buffer, app: &App, over: Rect, c: &Chrome) -> Option<Position> {
+    let ask = app.devices.ask.as_ref()?;
+    let room = over.width.saturating_sub(4);
+    let confirm = matches!(ask, Ask::Confirm { .. });
+    let mut row = prompt_row(app, confirm, action(ask, room));
+    // (A question that cannot be drawn must not stay open to answering keys: the frame ends it.)
+    if row.buttons_width() > room { app.devices.unfit.set(true); return None }
+    let input_focus = !app.devices.prompt_focus.get();
+    if !confirm && input_focus { row.chosen = usize::MAX }   // the input has the keys: no button chosen
+    let mut d = Dialog::new(&ask_title(app, ask), Vec::new(), &row, c);
+    d.border = crate::ui::dialog_border(&app.style_spec("menu-border-lines", app.active, app.focused()));
+    match ask {
+        Ask::Confirm { question, .. } => d.body = dialog::wrap(question, room.min(INPUT_W), c.base),
+        Ask::Entry { label, value, caret, secret, .. } => {
+            d.input = Some(Input { label, value, caret: *caret, select: None, secret: *secret, focused: input_focus, width: INPUT_W });
+            if let Some((m, error, _)) = &app.devices.footer { d.message = dialog::wrap(m, room.min(INPUT_W), if *error { c.danger } else { c.muted }) }
+        }
+    }
+    if !d.fit(over.height) { app.devices.unfit.set(true); return None }
+    let area = d.place(over);
+    d.render_over(over, area, buf);
+    let a = d.areas(area);
+    let cells = row.areas(a.row);
+    app.devices.prompt_actions.set(Some(PromptActions { size: app.size, accept: cells[1], cancel: cells[0], input: a.input }));
+    d.cursor(area)
+}
+
+/// After a frame: a question that had no room to be drawn is cancelled, as Close Tab's is when
+/// the terminal shrinks under it, and the person told why.
+pub fn cancel_unfit(app: &mut App) {
+    if !app.devices.unfit.take() || app.devices.ask.is_none() { return }
+    app.devices.ask = None;
+    app.devices.prompt_actions.set(None);
+    note(app, "Nothing changed");
+    app.say(crate::workspace_menu::TOO_SMALL_TO_ANSWER, theme::WARN);
+}
+
+/// The dialog's title: what is being done, and to what.
+fn ask_title(app: &App, ask: &Ask) -> String {
+    match ask {
+        Ask::Entry { what: Entry::Link { name, .. }, .. } | Ask::Confirm { act: Act::Link { name, .. }, .. } => format!("Connect · {name}"),
+        Ask::Entry { what: Entry::NewPassword | Entry::RepeatPassword { .. }, .. } | Ask::Confirm { act: Act::SetPassword(_), .. } => "Set Remote Password".into(),
+        Ask::Confirm { act: Act::ClearPassword, .. } => "Clear Remote Password".into(),
+        Ask::Entry { what: Entry::Rename { name, .. }, .. } => format!("Rename Computer · {name}"),
+        Ask::Confirm { act: Act::Rename { machine, .. }, .. } => format!("Rename Computer · {}", name_of(app, machine)),
+        Ask::Confirm { act: Act::Unlink { name, .. }, .. } => format!("Unlink · {name}"),
+        // (The row says "Remove from account…".)
+        Ask::Confirm { act: Act::Remove { name, .. }, .. } => format!("Remove from Account · {name}"),
+        Ask::Confirm { act: Act::Unpair { name, .. }, .. } => format!("Remove Access · {name}"),
+        Ask::Confirm { act: Act::ArmPhone, .. } => "Add Your Phone".into(),
+    }
+}
+
+/// The action button's word: Yes to a question; for a typed line what Enter does — Connect, Save,
+/// else Continue — or Next where [room] is narrower than `[ Cancel ]  [ <that> ]`.
+fn action(ask: &Ask, room: u16) -> &'static str {
+    let word = match ask {
+        Ask::Confirm { .. } => return "Yes",
+        Ask::Entry { what: Entry::Link { .. }, .. } => "Connect",
+        Ask::Entry { what: Entry::Rename { .. }, .. } => "Save",
+        Ask::Entry { .. } => "Continue",
+    };
+    if "[ Cancel ]  [  ]".width() + word.width() > room as usize { "Next" } else { word }
+}
+
+/// `[ Cancel ]  [ Yes ]`, or `[ Cancel ]  [ <action> ]` for a typed line, with the chosen button
+/// from the panel's state. [confirm] is passed because a key takes the ask out while it answers.
+fn prompt_row(app: &App, confirm: bool, action: &str) -> buttons::Row {
+    let key = |ch: char| confirm.then_some(ch);
+    buttons::Row {
+        buttons: vec![Button { label: "Cancel".into(), key: key('n') }, Button { label: action.into(), key: key('y') }],
+        chosen: app.devices.prompt_row.get().min(1),
+        hint: buttons::KEYS.into(),
+    }
 }
 
 /// [lines] in [r], each wrapped at its words; a dim span in the panel's muted colour. Returns the
@@ -1353,23 +1556,13 @@ fn text(buf: &mut Buffer, r: Rect, lines: &[Line<'static>], c: &Chrome) -> u16 {
     y.saturating_sub(r.y)
 }
 
-/// What the footer says: the question being asked, the typed line's keys, what just happened or
-/// went wrong, else the keys.
+/// What the footer says: what just happened or went wrong, else the keys — nothing while the
+/// dialog asks (what it says is in the dialog).
 fn footer(buf: &mut Buffer, app: &App, picker: &Picker, x: u16, y: u16, w: u16, c: &Chrome) {
-    let danger = c.base.patch(fg(theme::DANGER));
-    let (line, style) = match &app.devices.ask {
-        Some(Ask::Confirm { question, .. }) => (format!("{question}  y/n"), c.accent),
-        Some(Ask::Entry { what, .. }) => {
-            let go = match what { Entry::Link { .. } => "link", Entry::NewPassword => "next", Entry::RepeatPassword { .. } => "set", Entry::Rename { .. } => "rename" };
-            match app.devices.footer.as_ref() {
-                Some((t, err, _)) => (format!("{t}   enter {go}   esc cancel"), if *err { danger } else { c.muted }),
-                None => (format!("enter {go}   esc cancel"), c.muted),
-            }
-        }
-        None => match app.devices.footer.as_ref().filter(|(_, err, at)| *err || at.elapsed() < Duration::from_secs(6)) {
-            Some((t, err, _)) => (t.clone(), if *err { danger } else { c.accent }),
-            None => (format!("↑↓ move   enter choose   type to search   esc {}", if app.devices.sub.is_some() || picker.from_commands { "back" } else { "close" }), c.muted),
-        },
+    if app.devices.ask.is_some() { return }
+    let (line, style) = match app.devices.footer.as_ref().filter(|(_, err, at)| *err || at.elapsed() < Duration::from_secs(6)) {
+        Some((t, err, _)) => (t.clone(), if *err { c.danger } else { c.accent }),
+        None => (format!("↑↓ move   enter choose   type to search   esc {}", if app.devices.sub.is_some() || picker.from_commands { "back" } else { "close" }), c.muted),
     };
     // (Too long for one line — a question beside the QR code — it takes the line above too.)
     if line.width() as u16 <= w || y == 0 { settings::put(buf, x, y, w, &line, style); return }
@@ -1381,8 +1574,17 @@ fn footer(buf: &mut Buffer, app: &App, picker: &Picker, x: u16, y: u16, w: u16, 
 /// row's preview on the right — and for Add phone the QR code, as tall as the panel.
 pub fn draw(buf: &mut Buffer, app: &App, body: Rect, view: View, picker: &mut Picker) -> Option<Position> {
     let c = settings::chrome();
+    app.devices.prompt_actions.set(None);
+    app.devices.unfit.set(false);
+    app.devices.phone.drawn.set(None);
+    picker.screen_area.set(body);
+    picker.list_area.set(Rect::default());
+    picker.row_at.clear();
+    picker.preview_area.set(None);
+    picker.bar.set(None);
     settings::backdrop(buf, body, c.backdrop);
     if body.width < 24 || body.height < 8 {
+        if app.devices.ask.is_some() { app.devices.unfit.set(true) }
         settings::put(buf, body.x, body.y, body.width, &format!("{} · resize or Esc", view.title()), c.base);
         return None;
     }
@@ -1406,6 +1608,7 @@ pub fn draw(buf: &mut Buffer, app: &App, body: Rect, view: View, picker: &mut Pi
         text(buf, Rect::new(px, r.y + 3, right.saturating_sub(px), bottom.saturating_sub(r.y + 3)), &lines, &c);
     }
     footer(buf, app, picker, x, r.bottom().saturating_sub(2), inner_w, &c);
+    if app.devices.ask.is_some() { return ask_dialog(buf, app, r, &c) }
     cursor
 }
 
@@ -1466,7 +1669,8 @@ fn phone_draw(buf: &mut Buffer, app: &App, r: Rect, picker: &mut Picker, c: &Chr
     let bottom = r.bottom().saturating_sub(3);
     if top < bottom { settings::list(buf, picker, Rect::new(tx, top, tw, bottom - top), c, false) } else { picker.row_at.clear() }
     footer(buf, app, picker, tx, r.bottom().saturating_sub(2), tw, c);
-    None
+    // (The question goes over the words beside the code, so the code stays in view while it asks.)
+    ask_dialog(buf, app, Rect::new(tx, r.y, r.right().saturating_sub(tx), r.height), c)
 }
 
 #[cfg(test)]
@@ -1483,9 +1687,9 @@ mod tests {
         let (sink, _) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(19789, sink, size);
         app.fleet.local_id = LOCAL.into();
-        app.fleet.machines.push(crate::fleet::Machine { id: LOCAL.into(), name: "studio".into(), local: true, status: "online".into(), reach: Reach::Ready });
-        app.fleet.machines.push(crate::fleet::Machine { id: REMOTE.into(), name: "gpu-box".into(), local: false, status: "online".into(), reach: Reach::NeedsLink });
-        app.fleet.machines.push(crate::fleet::Machine { id: OFF.into(), name: "laptop".into(), local: false, status: "offline".into(), reach: Reach::Offline });
+        app.fleet.machines.push(crate::fleet::Machine { shared: false, id: LOCAL.into(), name: "studio".into(), local: true, status: "online".into(), reach: Reach::Ready });
+        app.fleet.machines.push(crate::fleet::Machine { shared: false, id: REMOTE.into(), name: "gpu-box".into(), local: false, status: "online".into(), reach: Reach::NeedsLink });
+        app.fleet.machines.push(crate::fleet::Machine { shared: false, id: OFF.into(), name: "laptop".into(), local: false, status: "offline".into(), reach: Reach::Offline });
         app
     }
 
@@ -1539,14 +1743,16 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_panel_lists_the_three_views_under_machines() {
+    fn the_commands_panel_lists_connect_machines_and_add_phone_under_machines() {
         let app = app((150, 42));
         let rows = crate::modal::command_rows(&app);
-        for view in View::ALL {
-            let row = rows.iter().find(|r| r.id == format!("cmd:{}", view.id())).unwrap_or_else(|| panic!("{} missing", view.id()));
-            assert_eq!(row.group.as_deref(), Some("Machines"));
-            assert!(crate::input::is_command(view.id()));
+        // (Connect a computer… only went to Connect machines…: one way in. Its command still runs.)
+        for (id, label) in [("devices", "Connect machines…"), ("add-phone", "Add phone…"), ("machines", "List machines")] {
+            let row = rows.iter().find(|r| r.id == format!("cmd:{id}")).unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!((row.label.as_str(), row.group.as_deref()), (label, Some("Machines")));
         }
+        assert!(!rows.iter().any(|r| r.id == "cmd:connect-machine"), "no second way to the same view");
+        for view in View::ALL { assert!(crate::input::is_command(view.id())) }
     }
 
     #[test]
@@ -1562,7 +1768,7 @@ mod tests {
         let groups: Vec<&str> = picker.rows.iter().filter_map(|r| r.group.as_deref()).collect::<Vec<_>>();
         let mut seen: Vec<&str> = Vec::new();
         for g in groups { if seen.last() != Some(&g) { seen.push(g) } }
-        assert_eq!(seen, vec!["This computer", "Your machines", "Linked from here", "Add a machine", "Set up a server"], "each group once, in order");
+        assert_eq!(seen, vec!["Account", "This computer", "Your machines", "Linked from here", "Add a machine", "Set up a server"], "each group once, in order");
         assert!(picker.rows.iter().any(|r| r.id == "add:login" && r.label == "2. Sign in as dev+hn@example.com"), "the server steps name the account");
         // A machine opens its actions: no Remove for this computer, Connect for one not linked.
         go_to(&mut app, &format!("m:{REMOTE}"));
@@ -1597,10 +1803,12 @@ mod tests {
                 _ => world(req),
             }));
             open(&mut app, View::Connect);
-            assert_eq!(ids(&app), vec!["here:login", "here:setup"]);
-            go_to(&mut app, "here:login");
+            assert_eq!(ids(&app), vec!["account", "local-use", "here:setup"]);
+            if let Some(Modal::Picker { picker, .. }) = &app.modal {
+                assert!(picker.rows.iter().any(|r| r.id == "local-use" && r.disabled));
+            }
             let (text, _) = screen(&mut app, 150, 42);
-            assert!(text.contains("Sign in on this computer") && text.contains("local agents work without"), "{text}");
+            assert!(text.contains("Local harnesses work without an account"), "{text}");
             assert!(!text.contains("Every machine on your account"));
             go_to(&mut app, "here:setup");
             press(&mut app, KeyCode::Enter);
@@ -1619,7 +1827,7 @@ mod tests {
         assert_eq!(app.devices.footer.as_ref().map(|f| f.0.as_str()), Some("Enter the remote password first"));
         typed(&mut app, "hunter2");
         let (s, _) = screen(&mut app, 150, 42);
-        assert!(s.contains("Remote password for gpu-box › •••••••") && !s.contains("hunter2"), "shown as dots:\n{s}");
+        assert!(s.contains("│ Remote password for gpu-box") && s.contains("│•••••••  ") && !s.contains("hunter2"), "shown as dots:\n{s}");
         press(&mut app, KeyCode::Enter);
         assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")), "nothing runs before the yes");
         assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })));
@@ -1632,6 +1840,382 @@ mod tests {
         let (s, _) = screen(&mut app, 150, 42);
         for stage in STAGES.iter().map(|s| s.1) { assert!(s.contains(&format!("✓ {stage}")), "{stage} done:\n{s}") }
         assert!(s.contains("Linked gpu-box"));
+    }
+
+    #[test]
+    fn clicking_a_machine_row_does_not_submit_the_password_prompt() {
+        let mut app = app((150, 42));
+        app.mouse = true;
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "unfinished-password");
+        screen(&mut app, 150, 42);
+        let Some(Modal::Picker { picker, .. }) = &app.modal else { panic!("no machines panel") };
+        let row = picker.row_at.iter().find(|(_, index)| picker.rows[picker.visible[*index].0].id == format!("m:{REMOTE}")).map(|(row, _)| *row).expect("visible machine row");
+        let column = picker.list_area.get().x + 2;
+        for kind in [crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)] {
+            crate::input::handle(&mut app, crossterm::event::Event::Mouse(crossterm::event::MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+        }
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "unfinished-password"), "clicking another control must not accept a password");
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+    }
+
+    fn click_at(app: &mut App, column: u16, row: u16) {
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+            crate::input::handle(app, crossterm::event::Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+        }
+    }
+
+    fn click_prompt(app: &mut App, accept: bool) {
+        let size = app.size;
+        screen(app, size.0, size.1);
+        let actions = app.devices.prompt_actions.get().expect("visible prompt actions");
+        let rect = if accept { actions.accept } else { actions.cancel };
+        click_at(app, rect.x + 1, rect.y);
+    }
+
+    #[test]
+    fn pasted_passwords_stay_masked_and_never_become_search_or_confirmation() {
+        for buffer in [false, true] {
+            let mut app = app((150, 42));
+            let log = fake(&mut app);
+            connect_to(&mut app, REMOTE.into());
+            if buffer {
+                crate::commands::execute(&mut app, "set-buffer -b private-test '秘密 pasted password'");
+                crate::commands::execute(&mut app, "paste-buffer -b private-test");
+            } else { crate::input::handle(&mut app, crossterm::event::Event::Paste("秘密 pasted password\r\n".into())); }
+            assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, secret:true, .. }) if value == "秘密 pasted password"));
+            let (visible, _) = screen(&mut app, 150, 42);
+            assert!(!visible.contains("pasted password"), "password is masked");
+            assert!(picker_mut(&mut app).unwrap().query.is_empty(), "password never enters the search");
+            press(&mut app, KeyCode::Enter);
+            crate::input::handle(&mut app, crossterm::event::Event::Paste("y\n".into()));
+            assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })), "paste is never a yes");
+            assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+            press(&mut app, KeyCode::Esc);
+            let (visible, _) = screen(&mut app, 150, 42);
+            assert!(!visible.contains("pasted password"));
+            assert!(picker_mut(&mut app).unwrap().query.is_empty());
+        }
+    }
+
+    #[test]
+    fn mouse_link_requires_continue_then_explicit_yes_and_cancel_writes_nothing() {
+        let mut app = app((150, 42));
+        app.mouse = true;
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "fixture password");
+        click_prompt(&mut app, true);
+        assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })));
+        click_prompt(&mut app, false);
+        assert!(app.devices.ask.is_none());
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "fixture password");
+        click_prompt(&mut app, true);
+        assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })));
+        click_prompt(&mut app, true);
+        assert_eq!(clis(&log, "link").iter().filter(|r| matches!(r, Req::Cli { args, stdin:Some(secret) } if args[1] == "connect" && secret == "fixture password")).count(), 1);
+        assert!(app.devices.ask.is_none(), "the release must not open the next row");
+    }
+
+    #[test]
+    fn device_confirmation_buttons_survive_resize_and_hidden_targets_do_not_run() {
+        let mut app = app((150, 42));
+        app.mouse = true;
+        let log = fake(&mut app);
+        crate::input::run(&mut app, "devices");
+        let clear = cli(&["remote-password", "clear", "--json"], None);
+        // (27 wide at the least: `[ Cancel ]  [ Yes ]` is 19 columns and the panel is 4 narrower
+        // than the screen, with 2 columns of inset each side; the old buttons fit in 24.)
+        for (w, h) in [(150, 42), (80, 24), (40, 12), (27, 10)] {
+            go_to(&mut app, "pw:clear");
+            press(&mut app, KeyCode::Enter);
+            crate::input::handle(&mut app, crossterm::event::Event::Resize(w, h));
+            let (visible, _) = screen(&mut app, w, h);
+            assert!(visible.contains("[ Yes ]") && visible.contains("[ Cancel ]"), "{w}x{h}:\n{visible}");
+            click_prompt(&mut app, false);
+            assert!(app.devices.ask.is_none());
+            assert!(!has(&log, &clear));
+        }
+        go_to(&mut app, "pw:clear"); press(&mut app, KeyCode::Enter);
+        crate::input::handle(&mut app, crossterm::event::Event::Resize(80, 24));
+        screen(&mut app, 80, 24);
+        // Too small to draw: the question is cancelled, never kept invisible to answer keys.
+        crate::input::handle(&mut app, crossterm::event::Event::Resize(12, 5));
+        screen(&mut app, 12, 5);
+        assert!(app.devices.prompt_actions.get().is_none());
+        assert!(app.devices.ask.is_none(), "cancelled");
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Make the terminal larger to answer this"));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!has(&log, &clear), "nothing answered it");
+        assert_eq!(app.devices.footer.as_ref().map(|f| f.0.as_str()), Some("Nothing changed"), "the cancel path ran");
+    }
+
+    #[test]
+    fn a_typed_line_that_cannot_fit_is_cancelled_too() {
+        let mut app = app((150, 42));
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "pw");
+        crate::input::handle(&mut app, crossterm::event::Event::Resize(20, 6));
+        screen(&mut app, 20, 6);
+        assert!(app.devices.ask.is_none());
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Make the terminal larger to answer this"));
+        press(&mut app, KeyCode::Enter);
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")), "the typed password went nowhere");
+    }
+
+    #[test]
+    fn dialog_titles_follow_the_naming_system() {
+        let mut app = app((150, 42));
+        let _log = fake(&mut app);
+        let title = |app: &mut App| { let (s, _) = screen(app, 150, 42); s.lines().find_map(|l| l.find("┌─").map(|i| l[i..].chars().skip(2).take_while(|c| *c != '─').collect::<String>().trim_end().to_string())).unwrap_or_default() };
+        connect_to(&mut app, REMOTE.into());
+        assert_eq!(title(&mut app), "Connect · gpu-box");
+        press(&mut app, KeyCode::Esc);
+        crate::input::run(&mut app, "devices");
+        go_to(&mut app, "pw:set");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Set Remote Password");
+        typed(&mut app, "a"); press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Set Remote Password", "the repeat step too");
+        typed(&mut app, "a"); press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Set Remote Password", "and its question");
+        press(&mut app, KeyCode::Esc);
+        go_to(&mut app, "pw:clear");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Clear Remote Password");
+        press(&mut app, KeyCode::Esc);
+        go_to(&mut app, &format!("m:{REMOTE}"));
+        press(&mut app, KeyCode::Enter);
+        go_to(&mut app, &format!("act:rename:{REMOTE}"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Rename Computer · gpu-box");
+        typed(&mut app, "2"); press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Rename Computer · gpu-box", "and its question");
+        press(&mut app, KeyCode::Esc);
+        go_to(&mut app, &format!("act:remove:{REMOTE}"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(title(&mut app), "Remove from Account · gpu-box", "echoing the row \"Remove from account…\"");
+    }
+
+    #[test]
+    fn typing_while_the_buttons_have_the_keys_goes_back_to_the_input() {
+        let mut app = app((150, 42));
+        let _log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "ab");
+        press(&mut app, KeyCode::Tab);
+        assert!(app.devices.prompt_focus.get(), "on the buttons");
+        // (h and l move between buttons there, but they are letters too.)
+        typed(&mut app, "hl");
+        assert!(!app.devices.prompt_focus.get(), "the input has the keys again");
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, caret: 4, .. }) if value == "abhl"), "{:?}", app.devices.ask);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        assert!(app.devices.prompt_focus.get(), "arrows still move between the buttons");
+    }
+
+    #[test]
+    fn prevent_new_links_starts_on_cancel_and_arrows_move_between_the_buttons() {
+        let mut app = app((150, 42));
+        let log = fake(&mut app);
+        crate::input::run(&mut app, "devices");
+        let clear = cli(&["remote-password", "clear", "--json"], None);
+        // The background under the first letter of [text]'s label.
+        let bg_of = |s: &str, buf: &Buffer, text: &str| {
+            let (y, line) = s.lines().enumerate().find(|(_, l)| l.contains(text)).expect("button row");
+            let x = line[..line.find(text).unwrap()].chars().count() as u16 + 2;
+            buf[(x, y as u16)].bg
+        };
+        let selected = settings::chrome().selected.bg;
+        go_to(&mut app, "pw:clear");
+        press(&mut app, KeyCode::Enter);
+        let (s, buf) = screen(&mut app, 150, 42);
+        assert!(s.contains("[ Cancel ]  [ Yes ]") && s.contains(buttons::KEYS), "the one keys hint every question shows: {s}");
+        if !crate::theme::no_color() {
+            assert_eq!(Some(bg_of(&s, &buf, "[ Cancel ]")), selected, "starts on Cancel");
+            assert_ne!(Some(bg_of(&s, &buf, "[ Yes ]")), selected);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.devices.ask.is_none(), "Enter on Cancel closes");
+        assert!(!has(&log, &clear));
+        go_to(&mut app, "pw:clear");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Right);
+        assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })), "an arrow keeps the prompt");
+        let (s, buf) = screen(&mut app, 150, 42);
+        if !crate::theme::no_color() { assert_eq!(Some(bg_of(&s, &buf, "[ Yes ]")), selected, "Right chose Yes"); }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(clis(&log, "remote-password").iter().filter(|r| **r == clear).count(), 1);
+    }
+
+    #[test]
+    fn the_password_input_keeps_the_arrows_until_tab_moves_the_keys_to_the_buttons() {
+        let mut app = app((150, 42));
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "abc");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "abc"), "arrows leave the typed value");
+        press(&mut app, KeyCode::Tab);
+        typed(&mut app, "y");
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "abyc"), "a letter is typed at the caret, not a button's");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.devices.ask.is_none(), "Enter on [ Cancel ] cancels, it does not submit");
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "abc");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })), "Tab back to the input: Enter continues");
+    }
+
+    /// The screen and where the terminal cursor is left.
+    fn screen_cursor(app: &mut App, w: u16, h: u16) -> (String, Buffer, Option<Position>) {
+        let (s, buf) = screen(app, w, h);
+        // (The panel's own answer, drawn again: a test terminal does not say where its cursor is.)
+        let Some(Modal::Picker { kind, mut picker }) = app.modal.take() else { panic!("no panel") };
+        let PickerKind::Devices(view) = kind else { panic!("not a devices view") };
+        let cursor = draw(&mut Buffer::empty(Rect::new(0, 0, w, h)), app, app.body(), view, &mut picker);
+        app.modal = Some(Modal::Picker { kind, picker });
+        (s, buf, cursor)
+    }
+
+    /// The screen's line with [text] on it.
+    fn line_with<'a>(s: &'a str, text: &str) -> &'a str { s.lines().find(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text:?} on screen:\n{s}")) }
+
+    #[test]
+    fn the_password_is_asked_in_a_dialog_and_the_search_line_stays_the_search() {
+        let mut app = app((150, 42));
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        let (s, _, _) = screen_cursor(&mut app, 150, 42);
+        assert!(s.contains("Search machines not linked yet"), "the search line is the panel's own:\n{s}");
+        assert!(!s.contains("› Remote password"), "no prompt in the search line:\n{s}");
+        assert!(s.contains("Connect · gpu-box") && s.contains("[ Cancel ]  [ Connect ]"), "the dialog:\n{s}");
+        assert!(s.contains("│ Remote password for gpu-box"), "the label inside the box:\n{s}");
+        assert!(s.contains("│ Enter the remote password set on this machine."), "the message inside the box:\n{s}");
+        typed(&mut app, "pass");
+        let (s, buf, cursor) = screen_cursor(&mut app, 150, 42);
+        assert!(line_with(&s, "••••").contains("│••••"), "typed into the input box, masked:\n{s}");
+        let at = cursor.expect("the terminal cursor is at the caret");
+        assert_eq!((buf[(at.x - 1, at.y)].symbol(), buf[(at.x, at.y)].symbol()), ("•", " "), "after the last dot");
+        // ← → move the caret; a paste goes in at it, never into the search.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        crate::input::handle(&mut app, crossterm::event::Event::Paste("XY".into()));
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "paXYss"), "{:?}", app.devices.ask);
+        assert!(picker_mut(&mut app).unwrap().query.is_empty());
+        let (_, _, moved) = screen_cursor(&mut app, 150, 42);
+        assert_eq!(moved, Some(Position::new(at.x, at.y)), "the caret after the paste: 4 dots in, as before");
+        // Tab: the keys to the buttons, Connect chosen; Enter on it goes on to the yes.
+        press(&mut app, KeyCode::Tab);
+        let (s, buf, cursor) = screen_cursor(&mut app, 150, 42);
+        assert_eq!(cursor, None, "no text cursor while the buttons have the keys");
+        if !crate::theme::no_color() {
+            let (y, line) = s.lines().enumerate().find(|(_, l)| l.contains("[ Connect ]")).unwrap();
+            let x = line[..line.find("[ Connect ]").unwrap()].chars().count() as u16 + 2;
+            assert_eq!(Some(buf[(x, y as u16)].bg), settings::chrome().selected.bg, "Connect is chosen");
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.devices.ask, Some(Ask::Confirm { act: Act::Link { password, .. }, .. }) if password == "paXYss"));
+        let (s, _, _) = screen_cursor(&mut app, 150, 42);
+        assert!(s.contains("Connect · gpu-box") && s.contains("Link gpu-box with this password?") && s.contains("[ Cancel ]  [ Yes ]"), "{s}");
+        assert!(s.contains("Search machines not linked yet"), "{s}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.devices.ask.is_none());
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")), "Esc sent nothing");
+    }
+
+    #[test]
+    fn a_click_on_the_input_gives_it_the_keys_and_a_click_beside_the_dialog_keeps_it() {
+        let mut app = app((150, 42));
+        app.mouse = true;
+        let log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        typed(&mut app, "ab");
+        press(&mut app, KeyCode::Tab);
+        screen(&mut app, 150, 42);
+        let input = app.devices.prompt_actions.get().and_then(|a| a.input).expect("the input box is kept for clicks");
+        click_at(&mut app, input.x + 3, input.y + 1);
+        typed(&mut app, "c");
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "abc"), "typing goes to the input again: {:?}", app.devices.ask);
+        // Beside the dialog, still on the panel: nothing happens; the typed line stays.
+        let panel = picker_mut(&mut app).unwrap().screen_area.get();
+        click_at(&mut app, panel.x + 3, panel.bottom() - 3);
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "abc"));
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+    }
+
+    #[test]
+    fn an_error_shows_in_the_dialog_and_rename_starts_from_the_current_name() {
+        let mut app = app((150, 42));
+        let _log = fake(&mut app);
+        connect_to(&mut app, REMOTE.into());
+        press(&mut app, KeyCode::Enter);
+        let (s, buf, _) = screen_cursor(&mut app, 150, 42);
+        let (y, line) = s.lines().enumerate().find(|(_, l)| l.contains("Enter the remote password first")).expect("the error");
+        assert!(line.contains("│ Enter the remote password first"), "inside the dialog:\n{s}");
+        if !crate::theme::no_color() {
+            let x = line[..line.find("Enter the remote").unwrap()].chars().count() as u16;
+            assert_eq!(buf[(x, y as u16)].fg, settings::chrome().danger.fg.unwrap(), "in the danger colour");
+        }
+        press(&mut app, KeyCode::Esc);
+        crate::input::run(&mut app, "devices");
+        go_to(&mut app, &format!("m:{REMOTE}"));
+        press(&mut app, KeyCode::Enter);
+        go_to(&mut app, &format!("act:rename:{REMOTE}"));
+        press(&mut app, KeyCode::Enter);
+        let (s, _, cursor) = screen_cursor(&mut app, 150, 42);
+        assert!(s.contains("Rename Computer · gpu-box") && s.contains("[ Cancel ]  [ Save ]"), "{s}");
+        assert!(line_with(&s, "│gpu-box").contains("│gpu-box"), "the current name in the input:\n{s}");
+        assert!(cursor.is_some());
+        press(&mut app, KeyCode::Backspace);
+        typed(&mut app, "X");
+        assert!(matches!(&app.devices.ask, Some(Ask::Entry { value, .. }) if value == "gpu-boX"));
+    }
+
+    #[test]
+    fn typed_line_prompts_say_next_when_narrow_and_continue_when_there_is_room() {
+        let mut app = app((150, 42));
+        app.mouse = true;
+        let log = fake(&mut app);
+        // (Screen width -> room in the dialog: 28 -> 20 for `[ Cancel ]  [ Next ]`, 31 -> 23 for
+        // Connect, 32 -> 24 for Continue.)
+        for (w, h, label) in [(28, 12, "[ Next ]"), (31, 12, "[ Connect ]"), (80, 24, "[ Connect ]")] {
+            connect_to(&mut app, REMOTE.into());
+            typed(&mut app, "pw");
+            crate::input::handle(&mut app, crossterm::event::Event::Resize(w, h));
+            let (visible, _) = screen(&mut app, w, h);
+            assert!(visible.contains(label) && visible.contains("[ Cancel ]"), "{w}x{h}:\n{visible}");
+            click_prompt(&mut app, true);
+            assert!(matches!(app.devices.ask, Some(Ask::Confirm { .. })), "{w}x{h}: the click continues");
+            press(&mut app, KeyCode::Esc);
+        }
+        assert!(clis(&log, "link").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "connect")));
+        crate::input::run(&mut app, "devices");
+        for (w, h, label) in [(28, 12, "[ Next ]"), (31, 12, "[ Next ]"), (32, 12, "[ Continue ]"), (80, 24, "[ Continue ]")] {
+            crate::input::handle(&mut app, crossterm::event::Event::Resize(150, 42));
+            go_to(&mut app, "pw:set");
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, "pw");
+            crate::input::handle(&mut app, crossterm::event::Event::Resize(w, h));
+            let (visible, _) = screen(&mut app, w, h);
+            assert!(visible.contains(label) && visible.contains("[ Cancel ]"), "{w}x{h}:\n{visible}");
+            click_prompt(&mut app, true);
+            assert!(matches!(app.devices.ask, Some(Ask::Entry { what: Entry::RepeatPassword { .. }, .. })), "{w}x{h}: the click continues");
+            press(&mut app, KeyCode::Esc);
+        }
+        assert!(clis(&log, "remote-password").iter().all(|r| !matches!(r, Req::Cli { args, .. } if args[1] == "set")));
     }
 
     /// M-l on a machine (the machines list) is this same flow: the panel, its password asked for.
@@ -1819,7 +2403,7 @@ mod tests {
                     View::Phone if w == 80 => assert!(s.contains("to show the QR code") && app.devices.phone.drawn.get().is_none(), "too small says so:\n{s}"),
                     View::Phone => assert!(app.devices.phone.drawn.get().is_some(), "{s}"),
                 }
-                if view == View::Phone { assert!(s.contains("y/n"), "asks before handing over the code:\n{s}") }
+                if view == View::Phone { assert!(s.contains("[ Cancel ]  [ Yes ]"), "asks before handing over the code:\n{s}") }
             }
         }
     }

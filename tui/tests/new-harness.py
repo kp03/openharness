@@ -24,7 +24,7 @@ HN = BASE / 'hn'
 shutil.copy2(os.environ.get('HN_NEW_UI_BINARY', ROOT / 'target/release/harness-tui'), HN)
 TMUX = shutil.which('tmux')
 assert TMUX
-ENV = {k: os.environ[k] for k in ('PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_PATH') if k in os.environ}
+ENV = {k: os.environ[k] for k in ('PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_PATH', 'LLVM_PROFILE_FILE') if k in os.environ}
 ENV.update(HOME=str(BASE), HN_TMPDIR=str(BASE), HN_SOCKET_NAME=PREFIX, PORT=str(PORT),
            RUST_BACKTRACE='1',
            TERM='xterm-256color', COLORTERM='truecolor', SHELL='/bin/sh', HARNESS_TUI_DESK='sync',
@@ -62,8 +62,8 @@ def form_screen():
 def settle_ui():
     # Wait for chooser content to redraw, not just tmux send-keys returning,
     # before taking mouse coordinates.
-    # The panels are borderless; crop around the centered form and right-hand chooser
-    # so animated working panes around them cannot keep the fixture unsettled.
+    # The panels are borderless; crop around the centered form (its choosers drop down
+    # inside it) so animated working panes around it cannot keep the fixture unsettled.
     previous, changed = None, time.monotonic()
     deadline = changed + 3
     while time.monotonic() < deadline:
@@ -71,17 +71,8 @@ def settle_ui():
         # Once the form/chooser closes, live panes are allowed to keep changing.
         if not any('›' in line for line in lines):
             return
-        width = max(map(len, lines), default=0)
-        height = len(lines) - 1  # hn's bottom status line
         left, top, form_w, form_h = form_bounds(lines)
-        side = width - (left + form_w) - 4 >= 32
         signature = tuple(line[left:left+form_w] for line in lines[top:top+form_h])
-        child_left = left + form_w + 2
-        header = lines[top+2][child_left+2:].lstrip() if top + 2 < len(lines) else ''
-        if side and (header.startswith('›') or header.startswith('Task (optional)')):
-            child_right = child_left + min(60, width - left - form_w - 4)
-            bottom = min(height - 1, top + 22)
-            signature += tuple(line[child_left:child_right] for line in lines[top:bottom])
         if signature != previous:
             previous, changed = signature, time.monotonic()
         elif time.monotonic() - changed >= .15:
@@ -133,7 +124,11 @@ def choose_field(label, query):
     wait(lambda: re.search(r'› Start ', form_screen()), 'choice accepted; launch action focused')
 def form_visible(): return re.search(field_at('Task'), form_screen()) is not None
 def new_form():
-    keys('C-b', 'N'); wait(form_visible, 'New Harness form')
+    wait(lambda:'+' in screen().splitlines()[-1], 'footer controls after status message')
+    lines=screen().splitlines()
+    footer=lines[-1]
+    click(footer.index('+'),len(lines)-1)
+    wait(form_visible, 'footer + opens New Harness form; clicked ' + str((footer.index('+'), len(lines)-1)) + '\nCaptured footer: ' + footer)
 def placement():
     window, windows, panes = hn('display-message', '-p', '#{window_id} #{session_windows} #{window_panes}').split()
     return window, int(windows), int(panes)
@@ -153,6 +148,10 @@ def end_new_terminal(previous_agents, previous_placement):
     with urllib.request.urlopen(request, timeout=2) as response:
         assert json.load(response)['data']['ok']
     wait(lambda: placement() == previous_placement, 'exited terminal removes its pane')
+    # The model loses the pane before its next terminal frame is painted. The
+    # shell footer is wider, so taking + coordinates from it clicks empty space
+    # after the agent footer returns (October 6 ARM native-fixture failure).
+    wait(lambda: ' · Agent default' not in screen().splitlines()[-1], 'exited terminal repaints the agent footer')
     assert 'The terminal closed' not in screen(), 'an ordinary shell must not leave an agent error card'
 def submit(count):
     # Git discovery is asynchronous. Wait for its answer before accepting the visible draft.
@@ -196,13 +195,16 @@ try:
     field('Project'); type_text('m2 webapp'); keys('Enter'); shows('webapp @ local')
     assert create_count() == before, 'searching projects across machines only changes the draft'
     print('PASS New Harness: short local machine name and remote folders after a large local history', flush=True)
-    # Moving over a field previews its choices beside the stationary form.
-    keys('Down', 'Tab'); shows('Search agents and harnesses')
-    assert field_position('Task') == anchor, 'a preview must not move or hide the form'
-    assert any(line.find('Search agents and harnesses') > anchor[0] + 50 for line in screen().splitlines())
+    # Moving over a field drops nothing down; entering it drops its chooser under it, in the form.
+    keys('Down', 'Tab')
+    # (Wait for the redraw that moved the pointer to Agent before reading what it shows.)
+    wait(lambda: re.search(r'›\s+(Agent|Harness)\s', form_screen()), 'Tab reaches Agent')
+    assert 'Search agents' not in screen(), 'arrowing over a field shows no chooser'
     keys('Right'); shows('Search agents and harnesses')
+    assert 'Search agents and harnesses' in form_screen(), 'the chooser drops down inside the form'
     assert field_position('Task') == anchor, 'entering a chooser keeps the form visible'
-    assert 'Blender' in screen(), 'the agent chooser lists the harnesses'
+    # (The dropdown shows a dozen rows; the harnesses follow the agents.)
+    keys('PageDown', 'PageDown'); assert 'Blender' in screen(), 'the agent chooser lists the harnesses'
     snapshot('new-harness-agent')
     type_text('codex'); keys('Escape')
     shows('Approvals'); keys('Right'); shows('Search agents and harnesses')
@@ -218,13 +220,15 @@ try:
     assert not re.search(field_at('Options|Machine'), form_screen()), 'settings are direct fields; machine belongs in Project'
     choose_field('Approvals', 'read only'); shows('Read only')
     task_text = 'Fix café login.\n\nKeep 界 and 🦀 intact.\nAdd a regression test.'
-    field('Task'); shows('enter start')
+    field('Task'); assert 'Enter start' not in form_screen() and 'Task is optional' not in form_screen()
     assert field_position('Task') == anchor, 'the task editor keeps the form visible and fixed'
     raw('\x1b[200~Fix café login.\r\n\r\nKeep 界 and 🦀 intact.\x1b[201~')
     shows('Keep 界 and 🦀 intact.')
     keys('M-Enter'); type_text('Add a regression test.'); keys('BTab')
     assert create_count() == before, 'leaving the task editor does not launch'
     snapshot('new-harness-settings')
+    field('Task'); keys('Enter')
+    assert create_count() == before, 'first task Enter only highlights Start'
     keys('Enter', 'Enter'); shows('Fixture launch failure')
     assert create_count() == before + 1, 'busy popup prevents double submission'
     shows('fail-once'); shows('Read only')
@@ -263,24 +267,25 @@ try:
     assert 'codexHome' not in request, request
     print('PASS New Harness: machine-scoped profiles and explicit model routes', flush=True)
 
-    # Blender asks for its coding agent next in the same side chooser.
+    # Blender asks for its coding agent next in the same chooser.
     new_form(); field('Agent|Harness'); type_text('Blender'); keys('Enter'); shows('Choose a coding agent'); type_text('codex'); keys('Enter'); shows('Blender · Codex')
     submit(before + 6)
     assert state()['created'][-1]['dsh'] == 'example/blender'
     new_form()
     before_terminal = placement()
     previous_agents = {a['id'] for a in state()['agents']}
-    field('Harness'); type_text('Terminal'); keys('Enter')
-    wait(lambda: create_count() == before + 7 and not form_visible(), 'Terminal choice opens a shell immediately')
+    field('Harness'); type_text('Terminal'); shows('Nothing matches')
+    keys('Escape', 'Escape', 'C-b', 'T')
+    wait(lambda: create_count() == before + 7 and not form_visible(), 'Terminal shortcut opens a shell immediately')
     snapshot('new-harness-terminal')
     placed_in_current_window(before_terminal)
     request = state()['created'][-1]
     assert request['engine'] == 'terminal' and request.get('permissionMode') is None, request
     assert not any(k in request for k in ('dsh', 'prompt', 'gridModel', 'gitSource', 'codexHome')), request
     end_new_terminal(previous_agents, before_terminal)
-    print('PASS New Harness: specialized harness compatibility and ordinary Terminal launch', flush=True)
+    print('PASS New Harness: specialized harness compatibility, agents exclude Terminal, separate shell shortcut', flush=True)
 
-    # The keyboard shortcut owns the same shell lifecycle as the chooser.
+    # The keyboard shortcut owns the same shell lifecycle on repeated use.
     # Its normal exit closes its view, rather than showing an agent error card.
     previous_agents = {a['id'] for a in state()['agents']}
     count = create_count()
@@ -290,7 +295,7 @@ try:
     request = state()['created'][-1]
     assert request['engine'] == 'terminal' and 'prompt' not in request and 'dsh' not in request, request
     end_new_terminal(previous_agents, before_terminal)
-    print('PASS New terminal: chooser and Ctrl+B T both close their views on normal shell exit', flush=True)
+    print('PASS New terminal: Ctrl+B T closes its view on normal shell exit', flush=True)
 
     new_form(); field('Agent|Harness'); type_text('claude'); keys('Enter'); choose_field('Approvals', 'plan'); shows('Plan first')
     keys('Escape'); new_form(); shows('Plan first')
@@ -314,7 +319,7 @@ try:
     shows('autonomous-harness @ local'); shows('[x]')
     tmux('resize-window', '-t', 'test', '-x', '150', '-y', '42'); settle_ui()
     snapshot('new-harness-flat')
-    field('Task'); shows('enter start')
+    field('Task'); assert 'Enter start' not in form_screen() and 'Task is optional' not in form_screen()
     raw('\x1b[200~Improve the New Harness keyboard flow.\nKeep the launch settings visible.\x1b[201~')
     shows('Keep the launch settings visible.'); snapshot('new-harness-task')
     keys('Escape'); new_form(); shows('Improve the New Harness keyboard flow.')
@@ -323,12 +328,25 @@ try:
     snapshot('new-harness-flat-narrow')
     # A terminal starts immediately and leaves the agent draft intact. Never run
     # the retained natural-language task as a shell command.
-    field('Agent|Harness'); type_text('Terminal'); keys('Enter')
+    keys('Escape', 'C-b', 'T')
     wait(lambda: create_count() == count + 1 and not form_visible(), 'terminal launch with retained agent draft')
     request = state()['created'][-1]
     assert request['engine'] == 'terminal' and 'prompt' not in request and 'command' not in request, request
     count += 1
+    # October 6 Linux CI: the create reply preceded the shell's first paint.
+    # Its wider context footer moves +, so wait for that visible transition
+    # before taking click coordinates from the screen.
+    wait(lambda: ' · Agent default' in screen().splitlines()[-1], 'new terminal paints its context footer')
     new_form(); shows('Improve the New Harness keyboard flow.')
+    choose_field('Agent|Harness', 'cursor')
+    field('Task'); keys('Enter', 'Enter'); shows('This agent cannot start with a task')
+    assert create_count() == count, 'unsupported first tasks never reach the daemon'
+    keys('Down')
+    assert re.search(r'›\s+Agent\s+Cursor', form_screen()), 'Down leaves the rejected task for Agent even in a narrow terminal'
+    keys('Right'); shows('Search agents and harnesses'); type_text('claude'); keys('Enter')
+    shows('Start Claude Code')
+    shows('Improve the New Harness keyboard flow.')
+    assert 'This agent cannot start with a task' not in screen(), 'keyboard-only agent correction clears the live error'
     field('Task'); keys('C-Home', 'C-k', 'C-k', 'C-k', 'C-k', 'Tab'); choose_field('Agent|Harness', 'claude')
     field('Task'); type_text('x' * 2001); keys('Enter'); field('Start Claude Code'); shows('Task is too long')
     assert create_count() == count, 'an overlong task is rejected before creating a harness'

@@ -46,11 +46,17 @@ def runtime_identity(runtime, commit):
 
 def stage(source, runtime, destination, commit, runtime_commit, agent=None):
     info = runtime_identity(runtime, runtime_commit)
+    shutil.copytree(source / 'os/connectors', destination / 'usr/lib/harness-os/connections',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    license_dir = destination / 'usr/share/licenses/harness-os-connections'
+    license_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / 'os/connectors/LICENSE', license_dir / 'LICENSE')
     # An allowlist keeps PC hooks and private fixture provisioning out of RPMs.
     paths = [
         'usr/bin/hn', 'usr/bin/harness', 'usr/bin/hn-browser',
         'usr/share/harness-os/foot.ini', 'usr/share/harness-os/tmux.conf',
         'usr/share/harness-os/lock/layout.ui', 'usr/share/harness-os/lock/style.css',
+        'usr/lib/udev/rules.d/70-harness-device.rules',
         *['usr/share/harness-os/labwc/' + name for name in ['autostart', 'shutdown', 'rc.xml']],
         *['usr/lib/harness-os/' + name for name in
           ['session', 'session-settings.py', 'runtime-path', 'wait-runtime', 'virtio-2d', 'open-wifi', 'open-updates', 'screen-action', 'screenshot', 'lock', 'files']],
@@ -70,6 +76,7 @@ def stage(source, runtime, destination, commit, runtime_commit, agent=None):
         ('docs/naming-system.md', 'usr/share/harness-os/guide/naming.md'),
         ('os/packaging/fedora/guide.md', 'usr/share/harness-os/guide.md'),
         ('os/packaging/fedora/AGENTS.md', 'usr/share/harness-os/AGENTS.md'),
+        ('os/root/usr/share/harness-os/connections.md', 'usr/share/harness-os/connections.md'),
         ('LICENSE', 'usr/share/licenses/harness-os/LICENSE'),
     ]:
         target = destination / name

@@ -537,7 +537,7 @@ fn pane_palette_for(native: Option<(Color, Color)>) -> PanePalette {
 /// fzf's colours — its dark256 default, or what `--color=light|16|bw` in `$FZF_DEFAULT_OPTS` asks
 /// for (and bw under NO_COLOR), so a list here looks like fzf does on this terminal.
 #[derive(Clone)]
-pub struct Fzf { pub reverse: bool, pub unicode: bool, pub pointer_char: String, pub marker_char: String, pub marker_multi: [String; 3], pub prompt_text: String, pub bg_plus: Color, pub hl: Color, pub prompt: Color, pub bw: bool, pub pal: fzfcolor::Palette }
+pub struct Fzf { pub reverse: bool, pub unicode: bool, pub pointer_char: String, pub marker_char: String, pub marker_multi: [String; 3], pub prompt_text: String, pub hl: Color, pub prompt: Color, pub pal: fzfcolor::Palette }
 
 impl Fzf {
     /// The border (and --border's glyphs) and the scrollbar: each its own slot.
@@ -574,14 +574,26 @@ pub fn fzf_spec(v: &str) -> (Option<Color>, Modifier) {
 
 /// What a list's change-* actions made of the look and the options (change-prompt, change-ghost,
 /// hide-input …): in force until the next list opens (fzf starts from its options each time).
+#[cfg(not(test))]
 static FZF_LIVE: std::sync::atomic::AtomicPtr<Fzf> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(not(test))]
 static OPTS_LIVE: std::sync::atomic::AtomicPtr<FzfOpts> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+// Each parallel test represents a separate UI client. Opening its picker must
+// not reset another test's in-progress frame or list options.
+#[cfg(test)]
+thread_local! {
+    static FZF_TEST_LIVE: std::cell::Cell<*mut Fzf> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static OPTS_TEST_LIVE: std::cell::Cell<*mut FzfOpts> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
 
 /// The look changed for this list (the one before stays: a reference to it may be held).
 pub fn fzf_change(f: impl FnOnce(&mut Fzf)) {
     let mut c = fzf().clone();
     f(&mut c);
+    #[cfg(not(test))]
     FZF_LIVE.store(Box::into_raw(Box::new(c)), std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    FZF_TEST_LIVE.set(Box::into_raw(Box::new(c)));
 }
 
 /// The options changed for this list.
@@ -590,17 +602,29 @@ pub fn opts_change(f: impl FnOnce(&mut FzfOpts)) {
     f(&mut c);
     // (No list or preview in hn draws a scrollbar, whatever a list asks: see fzf_opts_base.)
     (c.scrollbar, c.preview_scrollbar) = (None, None);
+    #[cfg(not(test))]
     OPTS_LIVE.store(Box::into_raw(Box::new(c)), std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    OPTS_TEST_LIVE.set(Box::into_raw(Box::new(c)));
 }
 
 /// A new list: the look and options as FZF_DEFAULT_OPTS has them.
 pub fn fzf_reset() {
+    #[cfg(not(test))]
     FZF_LIVE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+    #[cfg(not(test))]
     OPTS_LIVE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    FZF_TEST_LIVE.set(std::ptr::null_mut());
+    #[cfg(test)]
+    OPTS_TEST_LIVE.set(std::ptr::null_mut());
 }
 
 pub fn fzf() -> &'static Fzf {
+    #[cfg(not(test))]
     let live = FZF_LIVE.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(test)]
+    let live = FZF_TEST_LIVE.get();
     // SAFETY: set only from a leaked Box, never freed.
     if !live.is_null() { return unsafe { &*live } }
     fzf_base()
@@ -665,7 +689,7 @@ fn fzf_base() -> &'static Fzf {
             marker_char,
             // (Its first line only, as fzf's firstLine keeps it.)
             prompt_text: prompt.map(|p| p.split('\n').next().unwrap_or("").to_string()).unwrap_or_else(|| "> ".into()),
-            bg_plus: pal.current.style().bg.unwrap_or(Color::Reset), hl: fg(pal.matched), prompt: fg(pal.prompt), bw: !pal.colored, pal,
+            hl: fg(pal.matched), prompt: fg(pal.prompt), pal,
         }
     })
 }
@@ -857,7 +881,10 @@ pub struct FzfOpts { pub info_mode: String, pub prompt_top: bool, pub header_fir
     pub list_label_pos: (i64, bool), pub input_label_pos: (i64, bool), pub header_label_pos: (i64, bool), pub footer_label_pos: (i64, bool) }
 
 pub fn fzf_opts() -> &'static FzfOpts {
+    #[cfg(not(test))]
     let live = OPTS_LIVE.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(test)]
+    let live = OPTS_TEST_LIVE.get();
     // SAFETY: set only from a leaked Box, never freed.
     if !live.is_null() { return unsafe { &*live } }
     fzf_opts_base()
@@ -1325,11 +1352,14 @@ pub fn animation_frame() -> usize {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() / 100).unwrap_or(0)) as usize
 }
 
+/// hn's spinner, everywhere one turns (working dots, connecting cards, a list loading, a launch
+/// waiting): three dots chasing round all four rows of a braille cell, so it turns about the
+/// cell's middle. (fzf's ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ keep to the top three rows: it sat high in the cell.)
+pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠸", "⢰", "⣠", "⣄", "⡆", "⠇"];
+
 /// A spinner frame for things in motion (working dots, connecting cards).
 pub fn spinner(_tick: u64) -> &'static str {
-    // fzf's frames, in its order.
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    FRAMES[animation_frame() % FRAMES.len()]
+    SPINNER[animation_frame() % SPINNER.len()]
 }
 
 #[cfg(test)]
@@ -1426,6 +1456,7 @@ mod palette_tests {
     /// of it disagrees with the theme.
     #[test]
     fn palette_follows_the_terminal_answer() {
+        let _colours = crate::term_out::colours_lock();
         crate::term_out::set_terminal_colours(Some("#201f26".into()), Some("#f5f5f5".into()));
         let (bg, fg, light) = palette();
         assert_eq!(bg, Color::Rgb(0x20, 0x1f, 0x26), "dark bg must map to the terminal's rgb");

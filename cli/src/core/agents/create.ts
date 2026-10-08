@@ -33,7 +33,8 @@ import { writeGridConfigDir } from '../../lib/gridConfigDir.js'
 import { buildGridEngineLaunch, describeGridLaunch, gridConflictingEnvToClear, type GridLaunchMachine, type GridWebSearchStatus } from '../../lib/gridLaunch.js'
 import { DEFAULT_HARNESS_PERMISSION, freshHarnessEnvironment } from '../../lib/harnessDefaults.js'
 import { buildHarnessSessionLabel } from '../../lib/harnessSessionLabel.js'
-import { installCodexHooks, installOpencodePlugin } from '../../lib/hooks.js'
+import { engineHooks } from '../../engines/hooks.js'
+import { installOpencodePlugin } from '../../lib/hooks.js'
 import { sid } from '../../lib/log.js'
 import type { registry, RegisteredSession } from '../../lib/registry.js'
 import { stopSessionOwner, type SessionOwner } from '../../lib/sessionSearch/external.js'
@@ -41,6 +42,7 @@ import { clearPaneRemainOnExit } from '../../lib/tmux.js'
 import type { TmuxBackend } from '../../lib/tmuxBackend.js'
 import { TMUX_SESSION_ENV_MIN, tmuxSupportsSessionEnv } from '../../lib/tmuxVersion.js'
 import type { Adoption } from './adopt.js'
+import { prepareInstructionWrites, scmLaunchEnv } from '../../scm/scmProjects.js'
 import { mergedLaunchEnv } from './launchEnv.js'
 import type { createPaneWatcher } from './newPane.js'
 
@@ -81,7 +83,7 @@ export function createAgentCreator({
   prepareApiTools, hookPort, hooksDisabled, gridLaunchMachine, terminalHintMachineName, blocksFolder, gridSetup,
   privateGridName,
 }: CreateAgentDeps) {
-  const createAgent: CreateAgent = async ({ engine, cwd, bypassPermission, permissionMode, grid, codexHome, dsh, prompt, name, agent, resumeSessionId, takeOver }) => {
+  const createAgent: CreateAgent = async ({ engine, cwd, bypassPermission, permissionMode, grid, codexHome, dsh, prompt, name, agent, resumeSessionId, takeOver, scmLaunchRecord }) => {
     if (!tmuxBackend) return { ok: false, error: 'TMUX_UNAVAILABLE' }
     // A conversation Harness did not start opens in its own folder, under its own title — taken over
     // from the terminal that has it, when asked to.
@@ -130,6 +132,7 @@ export function createAgentCreator({
     // `TmuxBackend.inventory()`): the panes this daemon creates carry its tag, which goes with them into
     // any session the person moves them to.
     const label = buildHarnessSessionLabel(engine)
+    await prepareInstructionWrites(cwd)
     // Prepare the harness workspace, then bind its session context to the selected engine.
     // Missing packages or invalid runtimes refuse the launch before the agent is started.
     let dshEnv: Record<string, string> | undefined
@@ -231,7 +234,7 @@ export function createAgentCreator({
     // THAT folder, not the one `harness login` already installed into — without this, such an agent
     // fires no hook at all (no SessionStart/UserPromptSubmit/Stop) and never streams a single event.
     // Idempotent, so paying this on every create against an already-set-up profile is free.
-    if (codexHome && !hooksDisabled) installCodexHooks(hookPort, codexHome)
+    if (codexHome && !hooksDisabled) engineHooks.codex.installIn(hookPort, codexHome)
     // OpenCode may have upgraded from 1.x to 2.x while this daemon was running. Its new TUI must
     // not discover our old server plugin; the cached version probe changes with the executable.
     if (engine === 'opencode' && !hooksDisabled) installOpencodePlugin(hookPort)
@@ -289,10 +292,12 @@ export function createAgentCreator({
       cwd,
       sessionLabel: label,
       argv,
-      env: freshHarnessEnvironment(engine, mergedLaunchEnv(gridLaunch?.env ?? (codexHome ? { CODEX_HOME: codexHome } : undefined), dshEnv), !!grid || !!resumeSessionId,
+      env: freshHarnessEnvironment(engine, mergedLaunchEnv(mergedLaunchEnv(gridLaunch?.env ?? (codexHome ? { CODEX_HOME: codexHome } : undefined), dshEnv),
+        scmLaunchEnv(scmLaunchRecord)), !!grid || !!resumeSessionId,
         permissionMode ?? (bypassPermission ? DEFAULT_HARNESS_PERMISSION : 'ask')),
       grid: grid ? { baseUrl: grid.baseUrl, model: grid.model ?? null } : null,
       gridLaunchRecord: grid && gridLaunch ? { override: grid, webSearch: gridLaunch.webSearch } : null,
+      scmLaunchRecord: scmLaunchRecord ?? null,
       codexHome,
       dsh,
       dshRuntime: dsh ? label : null,

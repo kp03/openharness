@@ -7,12 +7,14 @@
  * Moved verbatim out of the hook server's options in `runForeground` (the core boundary, step 9:
  * docs/design/2026-10-03-harnessd.md).
  */
+import { hooksFor } from '../../engines/hooks.js'
+import type { HookTurnContext } from '../../engines/facets/hooks.js'
 import { removeCursorPendingTasks } from '../../engines/cursor/pendingTasks.js'
 import type { CursorSubagentManager } from '../../engines/cursor/subagent.js'
 import type { CursorTaskHookQueue } from '../../engines/cursor/taskHookQueue.js'
 import type { TurnRecaps } from './recaps.js'
 import { sid } from '../../lib/log.js'
-import type { LiveEvent, TurnState } from '../../lib/normalize.js'
+import type { LiveEvent } from '../../lib/normalize.js'
 import type { RegisteredSession } from '../../lib/registry.js'
 import type { SessionNormalizers } from '../transcripts/normalizers.js'
 
@@ -22,6 +24,8 @@ import type { SessionNormalizers } from '../transcripts/normalizers.js'
 // only if the turn is still open after this grace + a re-poll do we force-close (by then the assistant
 // text is on disk, so the natural close usually wins and the recap isn't empty).
 export const STOP_HOOK_GRACE_MS = 1_500
+/** How many sessions' latest prompt hooks are remembered. */
+const PROMPT_HOOKS_KEPT = 512
 
 export interface TurnHookDeps {
   resolve: (id: string) => RegisteredSession | undefined
@@ -43,7 +47,7 @@ export function createTurnHooks({
   resolve, normalizers, emit, drain, onCursorTaskStart, cursorTaskHooks, cursorSubagents, announceTurnAborted,
   armAgyIdleWatch, clearAgyIdleWatch, mirror, dataDir,
 }: TurnHookDeps) {
-  const { turnStates, commandcodeNormalizers, cursorNormalizers, devinReaders, copilotNormalizers, agyNormalizers, grokNormalizers } = normalizers
+  const { liveParsers, commandcodeNormalizers, cursorNormalizers, devinReaders, copilotNormalizers, agyNormalizers, grokNormalizers } = normalizers
   // Command Code's PreToolUse — the one live "a turn is running" signal this engine has. Without it the
   // adapter only learned of a turn from Stop, and emitted turn_started+turn_ended in the same
   // millisecond, so the device tile jumped from idle straight to the recap with no working state.
@@ -54,12 +58,47 @@ export function createTurnHooks({
     if (!normalizer) return
     emit(sessionId, normalizer.openTurn())   // no-op after the turn's first tool call
   }
+  /** When each session's latest prompt hook was run by its engine: a Stop run before it is about an earlier
+   *  turn. Bounded: a session's entry outlives it only until enough newer ones come. */
+  const promptFiredAt = new Map<string, number>()
+  const onPromptHook = (sessionId: string, firedAt: number): void => {
+    if (firedAt <= (promptFiredAt.get(sessionId) ?? 0)) return
+    promptFiredAt.delete(sessionId)
+    promptFiredAt.set(sessionId, firedAt)
+    if (promptFiredAt.size > PROMPT_HOOKS_KEPT) promptFiredAt.delete(promptFiredAt.keys().next().value!)
+  }
+  const hookTurns: HookTurnContext = {
+    turnState: (sessionId) => {
+      const parser = liveParsers.get(sessionId)
+      return parser && parser.engine === resolve(sessionId)?.engine ? parser.snapshot() : undefined
+    },
+    closeTurn: (sessionId, identity) => {
+      const parser = liveParsers.get(sessionId)
+      if (!parser || parser.engine !== resolve(sessionId)?.engine || parser.snapshot().identity !== identity) return false
+      parser.closeTurn('hook')
+      return true
+    },
+    latestPromptAt: (sessionId) => promptFiredAt.get(sessionId),
+    drain,
+    noteEngineStopped: (sessionId) => mirror.noteEngineStopped(sessionId),
+    emit,
+    graceMs: STOP_HOOK_GRACE_MS,
+  }
   const onToolStart = ({ sessionId, toolUseId, toolName, input: toolInput }: { sessionId: string; toolUseId: string; toolName: string; input: unknown }): void => {
     if (toolName === 'Task') onCursorTaskStart(sessionId, toolUseId, toolInput)
   }
-  const onTurnStop = ({ sessionId, status }: { sessionId: string; status?: string }): void => {
+  const onTurnStop = ({ sessionId, status, firedAt }: { sessionId: string; status?: string; firedAt?: number }): void => {
     const session = resolve(sessionId)
     if (!session) return
+    const hooks = hooksFor(session.engine)
+    if (hooks) {
+      // Invoke synchronously: the engine snapshots which turn the hook arrived about before draining.
+      const failed = (error: unknown): void => {
+        console.error(`[hooks] ${session.engine} stop hook failed:`, error instanceof Error ? error.message : error)
+      }
+      try { void Promise.resolve(hooks.onStop?.(hookTurns, { sessionId, status, firedAt })).catch(failed) } catch (error) { failed(error) }
+      return
+    }
     if (session.engine === 'cursor') {
       void (async () => {
         await cursorTaskHooks.wait(sessionId)
@@ -86,10 +125,6 @@ export function createTurnHooks({
       })
       return
     }
-    // claude: authoritative turn-close from the Stop/StopFailure hook. Drain any un-read JSONL FIRST
-    // (may emit the real turn_ended → st.turnOpen already false); only force-close if still open. A
-    // later real end_turn line is then a no-op (lineToEvents guards on state.turnOpen). This closes
-    // the B1/B2 cases (max_tokens/refusal/API-error/wedged tool) the JSONL parse would otherwise miss.
     // Command Code has no UserPromptSubmit and commits records per turn, so Stop is its authoritative
     // close: drain the transcript first (the natural close usually wins), then force-close what's left.
     if (session.engine === 'commandcode') {
@@ -190,34 +225,6 @@ export function createTurnHooks({
       })
       return
     }
-    if (session.engine !== 'claude') return
-    // A pass a blocking Stop hook continued (a /goal loop) is the transcript's to close, by its end_turn or
-    // turn_duration: the Stop of the pass before it reached the daemon 520 ms after it began (end to end,
-    // under load) and force-closed it while it ran. Only a StopFailure still closes one here.
-    const leftToTranscript = (st: TurnState): boolean => st.continued === true && status !== 'error'
-    void (async () => {
-      await drain(sessionId)
-      // A Stop hook is the one precise "the engine stopped writing" signal we get. When the mirror is
-      // HOLDING a turn-end for finished async sub-agents, this is what tells it the wrap-up message is
-      // on disk — without it the recap fires on its settle timer and can beat claude's closing summary
-      // to the punch (measured: recap at 10:18:41, wrap-up written at 10:18:44).
-      mirror.noteEngineStopped(sessionId)
-      const open = turnStates.get(sessionId)
-      if (!open?.turnOpen || leftToTranscript(open)) return // natural JSONL close already won → nothing to do
-      // Still open: the transcript may just be lagging the Stop hook. Wait, re-poll, and only force-close
-      // if it STILL hasn't closed — a genuinely wedged turn, whose assistant text is on disk by now.
-      await new Promise((r) => setTimeout(r, STOP_HOOK_GRACE_MS))
-      await drain(sessionId)
-      const st = turnStates.get(sessionId)
-      if (st?.turnOpen && !leftToTranscript(st)) {
-        st.turnOpen = false
-        st.pendingTools.clear()
-        console.log(`[turn] ${sid(sessionId)} force-closed by ${status === 'error' ? 'StopFailure' : 'Stop'} hook (after grace)`)
-        emit(sessionId, [{ type: 'turn_ended', payload: {} }])
-      }
-    })().catch((err) => {
-      console.error('[hooks] claude stop hook failed:', err instanceof Error ? err.message : err)
-    })
   }
-  return { onTurnStart, onToolStart, onTurnStop }
+  return { onTurnStart, onToolStart, onTurnStop, onPromptHook }
 }

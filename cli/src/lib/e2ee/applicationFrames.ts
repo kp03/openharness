@@ -23,7 +23,9 @@ const FLEET_REQUESTS = new Set(['grid_fleet_capabilities', 'grid_fleet_run', 'gr
   'grid_fleet_models_list', 'grid_fleet_model_download', 'grid_fleet_model_start', 'grid_fleet_model_stop'])
 const FLEET_RESULTS = new Set([...FLEET_REQUESTS].map(type => `${type}_result`))
 // `group_sync`: the trust-group roster exchange (groupSyncer.ts) — keys, so always sealed.
-const MACHINE_REQUESTS = new Set([...SHELL_REQUESTS, 'agent_purge', 'agent_worktree_delete', 'agents_cleanup_preview', 'agent_close', 'git_project_info', 'git_pull_request', 'machine_resources', 'api_connections', 'group_sync', 'phone_pair', 'viewer_surface', 'orchestrator', 'agent_handoff_prepare', ...OWNER_COMMAND_TYPES])
+const MACHINE_REQUESTS = new Set([...SHELL_REQUESTS, 'agent_purge', 'agent_worktree_delete', 'agents_cleanup_preview', 'agent_close', 'git_project_info', 'scm_project_info', 'git_pull_request', 'machine_resources', 'api_connections', 'group_sync', 'phone_pair', 'viewer_surface', 'orchestrator', 'agent_handoff_prepare',
+  // A device's notification sound and character: the audio or sprite bytes, and the test that plays them.
+  'harness_device_sound', 'harness_device_character', 'harness_device_test', ...OWNER_COMMAND_TYPES])
 const MACHINE_RESULTS = new Set([...MACHINE_REQUESTS].map(type => `${type}_result`))
 /** The pair brain, machine to machine (daemons/BRAIN.md). A watch carries question text and recaps; the
  * writes (answer, send, stop, start, pause, resume) act on a harness through the owning machine's floor
@@ -58,7 +60,7 @@ export function admitRelayedPairFrame(frame: { type?: unknown; payload?: unknown
 }
 export const encryptDownFrame = (type: string): boolean =>
   isEncryptedDownType(type) || MACHINE_REQUESTS.has(type) || FLEET_REQUESTS.has(type) || SHARE_REQUEST_TYPES.has(type) || VIEWER_DOWN_TYPES.has(type)
-  || PAIR_REQUESTS.has(type) || type === PLATE_REQUEST || TEAM_REQUEST_TYPES.has(type) || type === 'harness_device_sound' || type === 'harness_device_character' || type === 'harness_device_test'
+  || PAIR_REQUESTS.has(type) || type === PLATE_REQUEST || TEAM_REQUEST_TYPES.has(type)
 /** Client→daemon requests that older daemons took in the clear and no longer do. A client seals them
  * only for a daemon whose e2e_welcome says `strictDown` — an older one would never open the envelope
  * and would read the request as empty. A daemon that says `strictDown` refuses them unsealed. */
@@ -83,9 +85,6 @@ const QUESTION_RESULT = 'question_response_result'
  * plain reply it always had.
  */
 const SEALED_REPLIES = new Set([
-  'harness_device_sound_result',
-  'harness_device_character_result',
-  'harness_device_test_result',
   // What a pane runs and where: its folder, pid and tty.
   'terminal_info_result',
   // The rest of what a machine tells the client that asked about it: its Store harnesses, its engines

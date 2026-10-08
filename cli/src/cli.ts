@@ -45,7 +45,7 @@ import { flashCommand } from './lib/flash.js'
 import { awaitLoginCallback, extractCallbackParams, LOGIN_TIMEOUT_MESSAGE, type LoginCallbackParams } from './lib/loginCallback.js'
 import { AUTH_DIR, AuthSessionError, AuthSessionManager, clearAuthSession, knownSsoClientId, newSignInEpoch, readAuthSession, ssoClientIdFor, writeAuthSession, type AuthSession } from './lib/authSession.js'
 import { handOffToGrid } from './lib/gridHandoff.js'
-import { qrSignIn } from './lib/qrSignIn.js'
+import { claimTicket, qrSignIn, type QrSignInTokens } from './lib/qrSignIn.js'
 import { pickSignInMethod, signInMethodFlag, signInProviderName, withSignInProvider, type SignInMethod, type SignInProvider } from './lib/signInMethodPicker.js'
 import { watchJsonDriver, type JsonDriver } from './lib/jsonDriver.js'
 import { terminalQr } from './lib/terminalQr.js'
@@ -252,6 +252,26 @@ async function resolveComputerMachine(signal?: AbortSignal): Promise<AuthSession
 }
 
 
+/**
+ * After a sign-in by hand: which account it was made to (`/api/auth/me`, under the token it just got),
+ * kept beside its epoch. The device key log then starts over for that account whenever it first reads
+ * it — a daemon started more than ten minutes after `harness login` used to freeze on the new account
+ * instead, and trusted none of its devices. Merged into the newest file, as `resolveComputerMachine`
+ * does, and only while the session is still this sign-in's. Never fails the sign-in: without it the
+ * log keeps to the ten-minute window.
+ */
+async function recordSignInAccount(accessToken: string, signInEpoch: string, autonomousEnv: string): Promise<void> {
+  try {
+    const me = await requestJson<{ user?: { id?: unknown } }>('GET', '/api/auth/me', undefined, {
+      authorization: `Bearer ${accessToken}`, 'x-autonomous-env': autonomousEnv,
+    })
+    const acct = me?.user?.id
+    const latest = readAuthSession()
+    if (typeof acct !== 'string' || !acct || latest?.signInEpoch !== signInEpoch) return
+    writeAuthSession({ ...latest, signInAcct: acct })
+  } catch { /* no account recorded */ }
+}
+
 /** This machine's device key code. Signing in is what puts the key into the account, so `create` makes
  *  the identity when it is missing; the read-only commands (`status`, `auth status`) only look, and
  *  show nothing rather than mint a key. Null whenever it cannot be had. */
@@ -305,9 +325,11 @@ async function authStatusCommand(json: boolean): Promise<void> {
   if (json) console.log(JSON.stringify(payload))
   else {
     console.log(`\n  ${payload.loggedIn ? '✓ Signed in' : '✗ Not signed in'}${payload.machineId ? ` (machine ${payload.machineId})` : ''}${payload.loggedIn && payload.method === 'qr' ? ' — by your phone' : ''}\n`)
-    // A session a phone approved is Harness's own: the Autonomous services behind billing and grid
-    // do not take it. Say so where the person looks, not only when one of them refuses.
-    if (payload.loggedIn && payload.method === 'qr') console.log('  Billing and grid need a Google or Apple sign-in: harness login --force\n')
+    // A session a phone approved is Harness's own, and billing's Autonomous service does not take it.
+    // Say so where the person looks, not only when billing refuses. Grid is not named: it learns who
+    // holds a Harness-issued sign-in from the Harness backend (autonomous-grid ADR 0046), and naming
+    // it sent people to sign in again with Google or Apple for nothing.
+    if (payload.loggedIn && payload.method === 'qr') console.log('  Billing needs a Google or Apple sign-in: harness login --force\n')
   }
 }
 
@@ -375,7 +397,7 @@ async function loginCommand(
   foreground: boolean,
   force: boolean,
   json: boolean,
-  opts: { chained?: boolean; entryPoint?: string; method?: SignInMethod | 'ask' } = {},
+  opts: { chained?: boolean; entryPoint?: string; method?: SignInMethod | 'ask'; ticket?: string } = {},
 ): Promise<SignInOutcome> {
   if (foreground) throw new Error('`harness login` does not run the adapter. Use `harness start -f`.')
   // Which surface asked to sign in. A person in a terminal is `cli`; the desktop app runs this same
@@ -450,6 +472,9 @@ async function loginCommand(
       setWaiting(false)
     }
   }
+  // A box ticket before anything else: unlike every other sign-in it must never land on a computer
+  // that is already signed in, even with --force — the ticket stays unspent for the box it was for.
+  if (opts.ticket) return await ticketSignIn(json, emit, opts.ticket, (email) => succeed(false, email))
   if (readAuthSession() && !force) {
     // Guarded exactly like the identical call after the exchange below. Unguarded, a hiccup on
     // `/api/machines/resolve-computer` reached `onError`, which is JSON-unaware — so the ONE mode a
@@ -559,12 +584,7 @@ async function qrSignInCommand(
   succeed: (email: string) => Promise<SignInOutcome>,
   hooks: SignInHooks = {},
 ): Promise<SignInOutcome> {
-  const fail = (code: string, message: string): SignInOutcome => {
-    if (json) emit({ type: 'result', status: 'error', code, message })
-    else console.error(`\n  ✗ ${message}\n`)
-    process.exitCode = 1
-    return { signedIn: false }
-  }
+  const fail = signInFailure(json, emit)
   let shown = false
   const result = await qrSignIn({
     post: (path, body) => postJson(path, body),
@@ -593,22 +613,69 @@ async function qrSignInCommand(
     },
   })
   if (!result.ok) return fail(result.code, result.message)
-  const { tokens } = result
+  return await saveSignIn(result.tokens, (message) => fail('BACKEND_ERROR', message), succeed)
+}
+
+/** A refused sign-in: its coded result line under --json, a line on stderr otherwise; exit code 1. */
+function signInFailure(json: boolean, emit: (line: Record<string, unknown>) => void): (code: string, message: string) => SignInOutcome {
+  return (code, message) => {
+    if (json) emit({ type: 'result', status: 'error', code, message })
+    else console.error(`\n  ✗ ${message}\n`)
+    process.exitCode = 1
+    return { signedIn: false }
+  }
+}
+
+/**
+ * `harness login --ticket=<t>`: a headless box (no screen for a QR, no one to confirm) signed in with
+ * the ticket the phone handed it during setup. Refused on a computer that is already signed in, before
+ * the ticket is spent: whoever set this box up first keeps it.
+ */
+async function ticketSignIn(
+  json: boolean,
+  emit: (line: Record<string, unknown>) => void,
+  ticket: string,
+  succeed: (email: string) => Promise<SignInOutcome>,
+): Promise<SignInOutcome> {
+  const fail = signInFailure(json, emit)
+  if (readAuthSession()) return fail('ALREADY_SIGNED_IN', 'This computer is already signed in. The ticket was not used.')
+  const result = await claimTicket((path, body) => postJson(path, body), ticket)
+  if (!result.ok) return fail(result.code, result.message)
+  // The ticket is spent and the session written: a failure here would leave the box signed in yet
+  // reporting failure, its retry refused as ALREADY_SIGNED_IN and its daemon never moved onto the
+  // account. The machine id is not needed for that — the daemon starts on the computer id and
+  // resolves it itself (`resolveMachineIfUnknown`) — so the sign-in stands.
+  return await saveSignIn(result.tokens, (message) => {
+    console.error(`  (machine id not resolved yet — ${message}; the daemon resolves it as it starts)`)
+    return succeed(result.tokens.email)
+  }, succeed)
+}
+
+/** A QR or ticket sign-in's session on disk, its account recorded and its machine resolved.
+ *  `unresolved` answers a machine lookup that failed after the session was already written. */
+async function saveSignIn(
+  tokens: QrSignInTokens,
+  unresolved: (message: string) => SignInOutcome | Promise<SignInOutcome>,
+  succeed: (email: string) => Promise<SignInOutcome>,
+): Promise<SignInOutcome> {
+  const signInEpoch = newSignInEpoch()
+  const autonomousEnv = tokens.autonomousEnv ?? env.AUTONOMOUS_ENV
   writeAuthSession({
     version: 1,
     accessToken: tokens.token,
     ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
     ...(tokens.expiresIn ? { expiresAt: Date.now() + tokens.expiresIn * 1000 } : {}),
-    autonomousEnv: tokens.autonomousEnv ?? env.AUTONOMOUS_ENV,
+    autonomousEnv,
     computerId: computerId(),
     method: 'qr',
     updatedAt: Date.now(),
-    signInEpoch: newSignInEpoch(),
+    signInEpoch,
   })
+  await recordSignInAccount(tokens.token, signInEpoch, autonomousEnv)
   try {
     await resolveComputerMachine()
   } catch (err) {
-    return fail('BACKEND_ERROR', (err as Error).message)
+    return await unresolved((err as Error).message)
   }
   return await succeed(tokens.email)
 }
@@ -693,6 +760,7 @@ async function browserSignIn(
       throw err
     }
     const id = computerId()
+    const signInEpoch = newSignInEpoch()
     const session: AuthSession = {
       version: 1,
       accessToken: exchanged.token,
@@ -704,9 +772,10 @@ async function browserSignIn(
       // the clients were split signs every sign-in in as its configured one, and names none.
       ...(knownSsoClientId(exchanged.clientId) ? { clientId: knownSsoClientId(exchanged.clientId) } : {}),
       updatedAt: Date.now(),
-      signInEpoch: newSignInEpoch(),
+      signInEpoch,
     }
     writeAuthSession(session)
+    await recordSignInAccount(session.accessToken, signInEpoch, session.autonomousEnv)
     try {
       await resolveComputerMachine()
     } catch (err) {
@@ -781,13 +850,15 @@ async function gridLoginCommand(force: boolean, json: boolean): Promise<void> {
   }))
 }
 
-/** What `grid` itself said, carried out on the result line beside this command's own classification.
+/** What `grid` itself said, carried out on the result line beside `message` — which is already `grid`'s
+ *  own sentence when it refused with its `--json` envelope (`lib/gridHandoff.ts`), else the hand-off's.
  *
  *  `grid`'s answer on success is a JSON document on stdout, so it travels parsed, under `grid`. Its
  *  refusals go to **stderr** — every one of them already names its own way forward — and those
- *  travel verbatim under `detail`, because a client reading NDJSON off stdout would otherwise have
- *  the exit code and no sentence to show anybody. Both are omitted when empty rather than sent as
- *  `null`: an absent key reads as "the child said nothing there", which is what it means. */
+ *  travel verbatim under `detail` (the envelope line included), because a client reading NDJSON off
+ *  stdout would otherwise have the exit code and no sentence to show anybody. Both are omitted when
+ *  empty rather than sent as `null`: an absent key reads as "the child said nothing there", which is
+ *  what it means. */
 function gridSaid(handoff: { stdout: string; stderr: string }): Record<string, unknown> {
   const out = handoff.stdout.trim()
   const err = handoff.stderr.trim()
@@ -2412,6 +2483,7 @@ switch (cmd) {
     // account: the desktop app reads that line and does not wait for a restart it observes anyway.
     loginCommand(foreground, flags.includes('--force'), flags.includes('--json'), {
       entryPoint: entryPointFlag(),
+      ticket: flags.find((f) => f.startsWith('--ticket='))?.slice('--ticket='.length) || undefined,
       method: signInMethodFlag(flags) ?? (flags.includes('--json') || !process.stdin.isTTY ? undefined : 'ask'),
     })
       .then((outcome) => outcome.signedIn ? restartDaemonForIdentity(outcome.stoppedDaemon) : undefined)
@@ -2522,6 +2594,9 @@ switch (cmd) {
       output: (line) => console.log(line),
       error: (line) => console.error(line),
     }).then((code) => { process.exitCode = code }).catch(onError)
+    break
+  case 'shell-launch':
+    import('./shellLaunch.js').then(({ shellLaunch }) => shellLaunch(rest)).then((code) => { process.exitCode = code }).catch(onError)
     break
   case 'tui':
     tuiCommand(rest, { port: env.PORT, dataDir: env.ADAPTER_DATA_DIR, identity: wantedDaemonIdentity }).then((code) => { process.exitCode = code }).catch(onError)

@@ -11,11 +11,12 @@
  * `require` via the banner so ws's try/catch fallback works without them.
  */
 import * as esbuild from 'esbuild'
-import { appendFileSync, readFileSync, copyFileSync, rmSync } from 'fs'
+import { appendFileSync, readFileSync, copyFileSync, rmSync, writeFileSync } from 'fs'
 import { readDshRegistry } from './scripts/lib/dshRegistry.mjs'
 import { readBuiltinBundle, readHarnessMonitorBundle, readModelManagerBundle } from './scripts/lib/modelManagerBundle.mjs'
 import { readProcessImageBundle } from './scripts/lib/processImageBundle.mjs'
 import { leanBlock } from './scripts/lib/leanBlock.mjs'
+import { asciiOnly } from './scripts/lib/asciiOnly.mjs'
 import { fileURLToPath } from 'node:url'
 import { basename } from 'node:path'
 const modelManagerBundle = JSON.stringify(readModelManagerBundle(fileURLToPath(new URL('../store/agents/autonomous-grid', import.meta.url))))
@@ -57,7 +58,7 @@ const options = {
   // receives, and the published bundle IS that copy (upload-cli.sh ships `cli.js` and `notify.mjs`,
   // nothing else). `legalComments: 'eof'` below appends the dependencies' own notices; this is ours.
   banner: {
-    js: `/*! harness v${version} — Copyright (c) 2026 Autonomous, Inc. — MIT (https://github.com/autonomous-ai/openharness) */\n`
+    js: `/*! harness v${version} - Copyright (c) 2026 Autonomous, Inc. - MIT (https://github.com/autonomous-ai/openharness) */\n`
       + 'import{createRequire as ___cr}from"module";const require=___cr(import.meta.url);',
   },
   sourcemap: false,
@@ -67,12 +68,26 @@ const options = {
   logLevel: 'info',
 }
 
+// Both lean builds refer to one asset file. Moving Store setup out of the core must not duplicate the
+// release-owned harnesses in the services' build and the core's legacy inline-service fallback.
+const builtinAssetsName = 'harness-builtin-assets.mjs'
+const builtinAssets = await esbuild.build({
+  ...options, entryPoints: ['src/dsh/bundledFiles.ts'], write: false, logLevel: 'warning',
+})
+const sharedBuiltinAssets = {
+  name: 'shared-builtin-assets',
+  setup(build) {
+    build.onResolve({ filter: /^\.\/bundledFiles\.js$/ }, () => ({ path: `./${builtinAssetsName}`, external: true }))
+  },
+}
+
 // harnessd's master and its services, bundled on their own (src/leanEntry.ts): Node parses all of the
 // file a process starts on, and the whole CLI's cost each of them about 45 MiB at idle. Split, so that a
 // process parses only the files its own code is in: the master never the services', search never the
 // viewers'. Carried inside cli.js, at its end, as a comment Node only skims (scripts/lib/leanBlock.mjs).
 const lean = await esbuild.build({
   ...options,
+  plugins: [sharedBuiltinAssets],
   entryPoints: { harnessd: 'src/leanEntry.ts' },
   outdir: 'lean',
   splitting: true,
@@ -87,6 +102,7 @@ const lean = await esbuild.build({
 // meet in the folder they are written to.
 const leanCore = await esbuild.build({
   ...options,
+  plugins: [sharedBuiltinAssets],
   entryPoints: { 'harnessd-core': 'src/leanCoreEntry.ts' },
   outdir: 'lean',
   splitting: true,
@@ -95,11 +111,12 @@ const leanCore = await esbuild.build({
   write: false,
   logLevel: 'warning',
 })
-const leanFiles = Object.fromEntries(lean.outputFiles.map((file) => [basename(file.path), file.contents]))
+const leanFiles = Object.fromEntries(lean.outputFiles.map((file) => [basename(file.path), asciiOnly(file.text)]))
+leanFiles[builtinAssetsName] = asciiOnly(builtinAssets.outputFiles[0].text)
 for (const file of leanCore.outputFiles) {
   const name = basename(file.path)
   if (name in leanFiles) throw new Error(`the core's lean file ${name} has the name of one of the master's and the services'`)
-  leanFiles[name] = file.contents
+  leanFiles[name] = asciiOnly(file.text)
 }
 
 await esbuild.build({
@@ -110,6 +127,7 @@ await esbuild.build({
   entryPoints: ['src/entry.ts'],
   outfile: `${outDir}/cli.js`,
 })
+writeFileSync(`${outDir}/cli.js`, asciiOnly(readFileSync(`${outDir}/cli.js`, 'utf8')))
 appendFileSync(`${outDir}/cli.js`, leanBlock(leanFiles))
 
 copyFileSync('hook/notify.mjs', `${outDir}/notify.mjs`)

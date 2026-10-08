@@ -132,6 +132,10 @@ export function supervisorOptions(env: NodeJS.ProcessEnv, execArgv: readonly str
 /** The flags the core runs with: the master's own, with the heap limit its budget is a share of. */
 export function coreExecArgv(execArgv: readonly string[], heapLimitMiB: number): string[] {
   const rest = execArgv.filter((flag) => !/^--max[-_]old[-_]space[-_]size=/.test(flag))
+  // Node lets the young generation grow to 16 MiB per semi-space and keeps it: the core sat at 32 MB
+  // of new space holding 2.6 MB, 13 hours in (measured 2026-10-07). 4 MiB returns ~24 MB a process;
+  // scavenges run more often, each as cheap, since what survives one is that same small set.
+  if (!rest.some((flag) => /^--max[-_]semi[-_]space[-_]size=/.test(flag))) rest.push('--max-semi-space-size=4')
   return heapLimitMiB > 0 ? [...rest, `--max-old-space-size=${heapLimitMiB}`] : rest
 }
 
@@ -341,7 +345,7 @@ export function runMaster(config: MasterConfig): Supervisor {
         // Told which services this master runs, so it routes to exactly those and runs the rest itself;
         // and, from the lean bundle, which cli.js is its CLI (leanCoreEntry.ts).
         env: {
-          ...env, ...extra, HARNESSD_SERVICE_TOKEN: token, ...serviceProcessesEnv(specs),
+          ...env, ...extra, HARNESSD_SERVICE_TOKEN: token, ...serviceProcessesEnv(specs, process.pid),
           ...(script === config.scriptPath ? {} : { [LEAN_CORE_SCRIPT_ENV]: config.scriptPath }),
         },
         stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -405,4 +409,3 @@ export function runMaster(config: MasterConfig): Supervisor {
   if (!reexec?.replacing()) services.start()
   return supervisor
 }
-
